@@ -1,0 +1,10 @@
+# Binary file hasil build
+/main
+*.exe
+*.out
+
+# Folder vendor atau dependensi lokal (jika ada)
+/vendor
+
+# File environment
+.env
