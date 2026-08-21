@@ -4,14 +4,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-
+	"os"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/MicahParks/keyfunc/v3"
 )
 
 func AuthMiddleware() gin.HandlerFunc {
-	jwksURL := "https://jugqeqwfuwqwbcpvquwd.supabase.co/auth/v1/.well-known/jwks.json"
+	jwksURL := os.Getenv("SUPABASE_JWKS_URL")
 
 	kvs, err := keyfunc.NewDefault([]string{jwksURL})
 	if err != nil {
