@@ -27,7 +27,7 @@ func main() {
 		AllowOrigins: []string{
 			"http://localhost:5173",                 
 			"http://localhost:3000",                 
-			"https://teachpartner.skoolago.com/", 
+			"https://teachpartner.skoolago.com", 
 		},
 		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders: []string{"Origin", "Content-Type", "Authorization"},
