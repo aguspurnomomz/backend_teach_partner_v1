@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/MicahParks/keyfunc/v3 v3.8.1
+	github.com/gin-contrib/cors v1.7.7
 	github.com/gin-gonic/gin v1.12.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/generative-ai-go v0.20.1
