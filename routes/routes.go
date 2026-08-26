@@ -19,7 +19,7 @@ import (
 	"google.golang.org/api/option"
 )
 
-// --- Tambahan untuk superadmin *Agus 23 Agustus 2026 ---
+// --- Tambahan untuk superadmin struct *Agus 23 Agustus 2026 ---
 type AdminLoginRequest struct {
 	Email    string `json:"email" binding:"required,email"`
 	Password string `json:"password" binding:"required"`
@@ -27,6 +27,15 @@ type AdminLoginRequest struct {
 
 type UpdateUserStatusRequest struct {
 	IsActive bool `json:"is_active"`
+}
+
+type CreateEbookRequest struct {
+	Judul         string `json:"judul" binding:"required"`
+	Jenjang       string `json:"jenjang" binding:"required"`
+	MataPelajaran string `json:"mata_pelajaran" binding:"required"`
+	Kategori      string `json:"kategori" binding:"required"`
+	CoverUrl      string `json:"cover_url"`
+	FileUrl       string `json:"file_url" binding:"required"`
 }
 // -- Superadmin end --
 
@@ -274,11 +283,103 @@ func SetupRoutes(r *gin.Engine) {
 				"is_active": req.IsActive,
 			})
 		})
+
+		// Endpoint untuk melihat daftar e-book di panel superadmin
+		adminApi.GET("/ebooks", func(c *gin.Context) {
+			rows, err := database.DB.Query(`
+				SELECT id, judul, jenjang, mata_pelajaran, kategori, cover_url, file_url, created_at 
+				FROM ebooks 
+				ORDER BY created_at DESC
+			`)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data e-book: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type EbookItem struct {
+				ID            string    `json:"id"`
+				Judul         string    `json:"judul"`
+				Jenjang       string    `json:"jenjang"`
+				MataPelajaran string    `json:"mata_pelajaran"`
+				Kategori      string    `json:"kategori"` 
+				CoverUrl      string    `json:"cover_url"`
+				FileUrl       string    `json:"file_url"`
+				CreatedAt     time.Time `json:"created_at"`
+			}
+
+			var ebooks []EbookItem
+			for rows.Next() {
+				var e EbookItem
+				var coverUrl sql.NullString
+				
+				// PERBAIKAN: Masukkan e.Kategori ke dalam parameter Scan agar pas 8 kolom
+				err := rows.Scan(&e.ID, &e.Judul, &e.Jenjang, &e.MataPelajaran, &e.Kategori, &coverUrl, &e.FileUrl, &e.CreatedAt)
+				if err != nil {
+					continue
+				}
+				e.CoverUrl = coverUrl.String
+				ebooks = append(ebooks, e)
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"total_ebooks": len(ebooks),
+				"ebooks":       ebooks,
+			})
+		})
+
+		// Endpoint untuk menambah e-book baru oleh superadmin
+		adminApi.POST("/ebooks", func(c *gin.Context) {
+			var req CreateEbookRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format data e-book tidak valid: " + err.Error()})
+				return
+			}
+
+			var ebookID string
+			query := `INSERT INTO ebooks (judul, jenjang, mata_pelajaran, kategori, cover_url, file_url) 
+			          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`
+			
+			err := database.DB.QueryRow(query, req.Judul, req.Jenjang, req.MataPelajaran, req.Kategori, req.CoverUrl, req.FileUrl).Scan(&ebookID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan e-book ke database: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message":  "E-book berhasil ditambahkan",
+				"ebook_id": ebookID,
+			})
+		})
+
+		// Endpoint untuk menghapus e-book berdasarkan ID
+		adminApi.DELETE("/ebooks/:id", func(c *gin.Context) {
+			ebookID := c.Param("id")
+
+			query := `DELETE FROM ebooks WHERE id = $1`
+			result, err := database.DB.Exec(query, ebookID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus e-book: " + err.Error()})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "E-book tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":  "E-book berhasil dihapus",
+				"ebook_id": ebookID,
+			})
+		})
 	}
 
 	api := r.Group("/api")
 	api.Use(middleware.AuthMiddleware()) 
 	{
+		// Endpoint untuk get Profile User
 		api.GET("/profile", func(c *gin.Context) {
 			userID, _ := c.Get("user_id")
 
@@ -320,6 +421,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
+		// Endpoint untuk ubah Profile User
 		api.PUT("/profile", func(c *gin.Context) {
 			userID, _ := c.Get("user_id")
 
@@ -355,6 +457,7 @@ func SetupRoutes(r *gin.Engine) {
             c.JSON(http.StatusOK, gin.H{"message": "Identitas perangkat berhasil diperbarui"})
 		})
 
+		// Endpoint untuk Bank Soal *beta
 		api.POST("/question-banks", func(c *gin.Context) {
 			userID, _ := c.Get("user_id")
 
@@ -415,6 +518,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
+		// Ebdpoint generate bank soal *ai
 		api.POST("/ai/generate-questions", func(c *gin.Context) {
 			var req GenerateAIRequest
 			if err := c.ShouldBindJSON(&req); err != nil {
@@ -461,6 +565,72 @@ func SetupRoutes(r *gin.Engine) {
 			}
 
 			c.Data(http.StatusOK, "application/json", []byte(jsonResult))
+		})
+
+		// Endpoint bagi guru untuk melihat daftar e-book
+	
+		api.GET("/ebooks-list", func(c *gin.Context) {
+			rows, err := database.DB.Query(`
+				SELECT id, judul, jenjang, mata_pelajaran, kategori, cover_url, file_url, created_at 
+				FROM ebooks 
+				ORDER BY created_at DESC
+			`)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat daftar e-book"})
+				return
+			}
+			defer rows.Close()
+
+			type EbookPublicItem struct {
+				ID            string    `json:"id"`
+				Judul         string    `json:"judul"`
+				Jenjang       string    `json:"jenjang"`
+				MataPelajaran string    `json:"mata_pelajaran"`
+				Kategori      string    `json:"kategori"` 
+				CoverUrl      string    `json:"cover_url"`
+				FileUrl       string    `json:"file_url"`
+			}
+
+			var list []EbookPublicItem
+			for rows.Next() {
+				var item EbookPublicItem
+				var cover sql.NullString
+				var createdAt time.Time
+				
+			
+				if err := rows.Scan(&item.ID, &item.Judul, &item.Jenjang, &item.MataPelajaran, &item.Kategori, &cover, &item.FileUrl, &createdAt); err == nil {
+					item.CoverUrl = cover.String
+					list = append(list, item)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"ebooks": list})
+		})
+
+		// Endpoint untuk mencatat riwayat akses/unduh e-book oleh guru
+		api.POST("/ebooks-list/history", func(c *gin.Context) {
+			userID, _ := c.Get("user_id")
+
+			var req struct {
+				EbookID    string `json:"ebook_id" binding:"required"`
+				ActionType string `json:"action_type" binding:"required"` // 'view' atau 'download'
+			}
+
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Data riwayat tidak valid"})
+				return
+			}
+
+			_, err := database.DB.Exec(
+				`INSERT INTO ebook_history (user_id, ebook_id, action_type) VALUES ($1, $2, $3)`,
+				userID, req.EbookID, req.ActionType,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mencatat riwayat e-book"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Riwayat berhasil dicatat/disimpan"})
 		})
 	}
 }
