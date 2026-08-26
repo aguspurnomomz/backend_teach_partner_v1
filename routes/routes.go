@@ -2,6 +2,7 @@ package routes
 
 import (
 	"context"
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -142,6 +143,31 @@ func AdminAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
+func sendWhatsAppNotification(targetPhone string, message string) {
+	apiToken := os.Getenv("WA_GATEWAY_TOKEN")
+	apiURL := os.Getenv("WA_GATEWAY_URL") 
+
+	if apiToken == "" || apiURL == "" || targetPhone == "" {
+		return 
+	}
+
+	payload := map[string]string{
+		"target":  targetPhone,
+		"message": message,
+	}
+	jsonBody, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", apiToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	_, _ = client.Do(req)
+}
+
 func SetupRoutes(r *gin.Engine) {
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "Server berjalan dengan baik"})
@@ -184,6 +210,17 @@ func SetupRoutes(r *gin.Engine) {
 
 		// Catat log sukses login
 		logSuperAdminActivity(adminID, "LOGIN_SUCCESS", c.ClientIP(), c.Request.UserAgent(), "Login berhasil")
+
+		
+		var waNumber sql.NullString
+		_ = database.DB.QueryRow(`SELECT no_whatsapp FROM super_admins WHERE id = $1`, adminID).Scan(&waNumber)
+
+		if waNumber.Valid && waNumber.String != "" {
+			ipClient := c.ClientIP()
+			userAgent := c.Request.UserAgent()
+			pesanWA := fmt.Sprintf("🔐 *INFO LOGIN SUPERADMIN*\n\nAkun Superadmin Anda baru saja berhasil masuk (Login) pada %s.\n📍 IP: %s\n💻 Perangkat: %s\n\nJika ini bukan Anda, segera amankan akun Anda!", time.Now().Format("02-01-2006 15:04:05"), ipClient, userAgent)
+			go sendWhatsAppNotification(waNumber.String, pesanWA)
+		}
 
 		jwtSecret := os.Getenv("JWT_ADMIN_SECRET")
 		if jwtSecret == "" {
@@ -263,9 +300,8 @@ func SetupRoutes(r *gin.Engine) {
 		})
 
 		adminApi.POST("/change-password", func(c *gin.Context) {
-			adminIDVal, exists := c.Get("admin_id") // Ambil dari claims middleware jika disimpan, atau query ulang berdasarkan email
+			adminIDVal, exists := c.Get("admin_id")
 			if !exists {
-				// Fallback jika admin_id belum disimpan di context middleware, kita ambil dari email claims
 				email := c.MustGet("admin_email").(string)
 				err := database.DB.QueryRow(`SELECT id FROM super_admins WHERE email = $1`, email).Scan(&adminIDVal)
 				if err != nil {
@@ -273,7 +309,7 @@ func SetupRoutes(r *gin.Engine) {
 					return
 				}
 			}
-			adminID := int(adminIDVal.(float64)) // Jika dari jwt.MapClaims biasanya float64
+			adminID := int(adminIDVal.(float64))
 
 			var req ChangePasswordRequest
 			if err := c.ShouldBindJSON(&req); err != nil {
@@ -281,9 +317,10 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			// Ambil hash password lama dari database
+		
 			var currentHash string
-			err := database.DB.QueryRow(`SELECT password_hash FROM super_admins WHERE id = $1`, adminID).Scan(&currentHash)
+			var waNumber sql.NullString
+			err := database.DB.QueryRow(`SELECT password_hash, no_whatsapp FROM super_admins WHERE id = $1`, adminID).Scan(&currentHash, &waNumber)
 			if err != nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": "Data admin tidak ditemukan"})
 				return
@@ -303,15 +340,21 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			// Update ke database
+		
 			_, err = database.DB.Exec(`UPDATE super_admins SET password_hash = $1, updated_at = NOW() WHERE id = $2`, string(newHashBytes), adminID)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan kata sandi ke database"})
 				return
 			}
 
-			// Catat log aktivitas ganti password
+		
 			logSuperAdminActivity(adminID, "CHANGE_PASSWORD", c.ClientIP(), c.Request.UserAgent(), "Berhasil mengubah kata sandi")
+
+		
+			if waNumber.Valid && waNumber.String != "" {
+				pesanWA := fmt.Sprintf("⚠️ *PERINGATAN KEAMANAN*\n\nKata sandi akun Superadmin Anda baru saja diubah pada %s.\nJika Anda tidak merasa melakukan ini, segera amankan akun Anda!", time.Now().Format("02-01-2006 15:04:05"))
+				go sendWhatsAppNotification(waNumber.String, pesanWA)
+			}
 
 			c.JSON(http.StatusOK, gin.H{"message": "Kata sandi berhasil diperbarui"})
 		})
