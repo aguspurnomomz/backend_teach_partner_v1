@@ -37,6 +37,11 @@ type CreateEbookRequest struct {
 	CoverUrl      string `json:"cover_url"`
 	FileUrl       string `json:"file_url" binding:"required"`
 }
+
+type ChangePasswordRequest struct {
+	OldPassword string `json:"old_password" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required,min=6"`
+}
 // -- Superadmin end --
 
 type UpdateProfileRequest struct {
@@ -87,6 +92,14 @@ type GenerateAIRequest struct {
 	CognitiveLevel string `json:"cognitive_level"`
 }
 
+func logSuperAdminActivity(adminID int, action, ipAddress, userAgent, details string) {
+	query := `INSERT INTO super_admin_logs (admin_id, action, ip_address, user_agent, details) VALUES ($1, $2, $3, $4, $5)`
+	_, err := database.DB.Exec(query, adminID, action, ipAddress, userAgent, details)
+	if err != nil {
+		fmt.Printf("Gagal mencatat log superadmin: %v\n", err)
+	}
+}
+
 func AdminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
@@ -119,7 +132,12 @@ func AdminAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// Simpan email dan admin_id ke context agar bisa diakses handler berikutnya
 		c.Set("admin_email", claims["email"])
+		if adminID, ok := claims["admin_id"]; ok {
+			c.Set("admin_id", adminID)
+		}
+		
 		c.Next()
 	}
 }
@@ -127,6 +145,11 @@ func AdminAuthMiddleware() gin.HandlerFunc {
 func SetupRoutes(r *gin.Engine) {
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "Server berjalan dengan baik"})
+	})
+
+	// --- Endpoint Debug Sentry ---
+	r.GET("/debug-sentry", func(c *gin.Context) {
+		panic("Test Sentry Error dari Backend Golang!")
 	})
 
 	r.POST("/api/superadmin/superadmin-login", func(c *gin.Context) {
@@ -153,9 +176,14 @@ func SetupRoutes(r *gin.Engine) {
 
 		err = bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(req.Password))
 		if err != nil {
+			// Catat log gagal login (opsional)
+			logSuperAdminActivity(adminID, "LOGIN_FAILED", c.ClientIP(), c.Request.UserAgent(), "Password salah")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Kata sandi salah, periksa kembali!"})
 			return
 		}
+
+		// Catat log sukses login
+		logSuperAdminActivity(adminID, "LOGIN_SUCCESS", c.ClientIP(), c.Request.UserAgent(), "Login berhasil")
 
 		jwtSecret := os.Getenv("JWT_ADMIN_SECRET")
 		if jwtSecret == "" {
@@ -192,6 +220,100 @@ func SetupRoutes(r *gin.Engine) {
 				"message": "Selamat datang di Panel Superadmin!",
 				"admin":   c.MustGet("admin_email"),
 			})
+		})
+
+		adminApi.GET("/logs", func(c *gin.Context) {
+			rows, err := database.DB.Query(`
+				SELECT l.id, a.email, l.action, l.ip_address, l.user_agent, l.details, l.created_at 
+				FROM super_admin_logs l
+				LEFT JOIN super_admins a ON l.admin_id = a.id
+				ORDER BY l.created_at DESC
+				LIMIT 50
+			`)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat log aktivitas: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type LogItem struct {
+				ID        int       `json:"id"`
+				Email     string    `json:"email"`
+				Action    string    `json:"action"`
+				IpAddress string    `json:"ip_address"`
+				UserAgent string    `json:"user_agent"`
+				Details   string    `json:"details"`
+				CreatedAt time.Time `json:"created_at"`
+			}
+
+			var logs []LogItem
+			for rows.Next() {
+				var item LogItem
+				var email, ip, ua, details sql.NullString
+				if err := rows.Scan(&item.ID, &email, &item.Action, &ip, &ua, &details, &item.CreatedAt); err == nil {
+					item.Email = email.String
+					item.IpAddress = ip.String
+					item.UserAgent = ua.String
+					item.Details = details.String
+					logs = append(logs, item)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"logs": logs})
+		})
+
+		adminApi.POST("/change-password", func(c *gin.Context) {
+			adminIDVal, exists := c.Get("admin_id") // Ambil dari claims middleware jika disimpan, atau query ulang berdasarkan email
+			if !exists {
+				// Fallback jika admin_id belum disimpan di context middleware, kita ambil dari email claims
+				email := c.MustGet("admin_email").(string)
+				err := database.DB.QueryRow(`SELECT id FROM super_admins WHERE email = $1`, email).Scan(&adminIDVal)
+				if err != nil {
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "Sesi admin tidak dikenali"})
+					return
+				}
+			}
+			adminID := int(adminIDVal.(float64)) // Jika dari jwt.MapClaims biasanya float64
+
+			var req ChangePasswordRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format input tidak valid (minimal 6 karakter): " + err.Error()})
+				return
+			}
+
+			// Ambil hash password lama dari database
+			var currentHash string
+			err := database.DB.QueryRow(`SELECT password_hash FROM super_admins WHERE id = $1`, adminID).Scan(&currentHash)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Data admin tidak ditemukan"})
+				return
+			}
+
+			// Verifikasi password lama
+			err = bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(req.OldPassword))
+			if err != nil {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Kata sandi lama salah!"})
+				return
+			}
+
+			// Hash password baru
+			newHashBytes, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memproses kata sandi baru"})
+				return
+			}
+
+			// Update ke database
+			_, err = database.DB.Exec(`UPDATE super_admins SET password_hash = $1, updated_at = NOW() WHERE id = $2`, string(newHashBytes), adminID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan kata sandi ke database"})
+				return
+			}
+
+			// Catat log aktivitas ganti password
+			logSuperAdminActivity(adminID, "CHANGE_PASSWORD", c.ClientIP(), c.Request.UserAgent(), "Berhasil mengubah kata sandi")
+
+			c.JSON(http.StatusOK, gin.H{"message": "Kata sandi berhasil diperbarui"})
 		})
 
 		// Endpoint untuk melihat daftar pengguna terdaftar beserta is_active dan last_login
@@ -313,7 +435,6 @@ func SetupRoutes(r *gin.Engine) {
 				var e EbookItem
 				var coverUrl sql.NullString
 				
-				// PERBAIKAN: Masukkan e.Kategori ke dalam parameter Scan agar pas 8 kolom
 				err := rows.Scan(&e.ID, &e.Judul, &e.Jenjang, &e.MataPelajaran, &e.Kategori, &coverUrl, &e.FileUrl, &e.CreatedAt)
 				if err != nil {
 					continue
@@ -346,6 +467,13 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
+			// --- CATAT LOG TAMBAH E-BOOK ---
+			adminIDVal, _ := c.Get("admin_id")
+			if adminIDVal != nil {
+				adminID := int(adminIDVal.(float64))
+				logSuperAdminActivity(adminID, "ADD_EBOOK", c.ClientIP(), c.Request.UserAgent(), fmt.Sprintf("Menambahkan e-book: %s", req.Judul))
+			}
+
 			c.JSON(http.StatusCreated, gin.H{
 				"message":  "E-book berhasil ditambahkan",
 				"ebook_id": ebookID,
@@ -355,6 +483,9 @@ func SetupRoutes(r *gin.Engine) {
 		// Endpoint untuk menghapus e-book berdasarkan ID
 		adminApi.DELETE("/ebooks/:id", func(c *gin.Context) {
 			ebookID := c.Param("id")
+
+			var judulBuku string
+			_ = database.DB.QueryRow(`SELECT judul FROM ebooks WHERE id = $1`, ebookID).Scan(&judulBuku)
 
 			query := `DELETE FROM ebooks WHERE id = $1`
 			result, err := database.DB.Exec(query, ebookID)
@@ -367,6 +498,13 @@ func SetupRoutes(r *gin.Engine) {
 			if rowsAffected == 0 {
 				c.JSON(http.StatusNotFound, gin.H{"error": "E-book tidak ditemukan"})
 				return
+			}
+
+			// --- CATAT LOG HAPUS E-BOOK ---
+			adminIDVal, _ := c.Get("admin_id")
+			if adminIDVal != nil {
+				adminID := int(adminIDVal.(float64))
+				logSuperAdminActivity(adminID, "DELETE_EBOOK", c.ClientIP(), c.Request.UserAgent(), fmt.Sprintf("Menghapus e-book: %s", judulBuku))
 			}
 
 			c.JSON(http.StatusOK, gin.H{
@@ -518,7 +656,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
-		// Ebdpoint generate bank soal *ai
+		// Endpoint generate bank soal *ai
 		api.POST("/ai/generate-questions", func(c *gin.Context) {
 			var req GenerateAIRequest
 			if err := c.ShouldBindJSON(&req); err != nil {
@@ -568,7 +706,6 @@ func SetupRoutes(r *gin.Engine) {
 		})
 
 		// Endpoint bagi guru untuk melihat daftar e-book
-	
 		api.GET("/ebooks-list", func(c *gin.Context) {
 			rows, err := database.DB.Query(`
 				SELECT id, judul, jenjang, mata_pelajaran, kategori, cover_url, file_url, created_at 
@@ -597,7 +734,6 @@ func SetupRoutes(r *gin.Engine) {
 				var cover sql.NullString
 				var createdAt time.Time
 				
-			
 				if err := rows.Scan(&item.ID, &item.Judul, &item.Jenjang, &item.MataPelajaran, &item.Kategori, &cover, &item.FileUrl, &createdAt); err == nil {
 					item.CoverUrl = cover.String
 					list = append(list, item)

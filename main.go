@@ -3,7 +3,10 @@ package main
 import (
 	"log"
 	"os"
+	"time"
 
+	"github.com/getsentry/sentry-go"
+	sentrygin "github.com/getsentry/sentry-go/gin"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -18,10 +21,31 @@ func main() {
 		log.Println("Peringatan: File .env tidak ditemukan, menggunakan environment system")
 	}
 
+	
+	dsn := os.Getenv("SENTRY_DSN")
+	if dsn == "" {
+		// Fallback langsung ke DSN dari Sentry Anda jika belum ada di .env
+		dsn = "https://e365332f65f5668dd790f18ca57790ab@o4511336547221504.ingest.us.sentry.io/4511977382281216"
+	}
+
+	err = sentry.Init(sentry.ClientOptions{
+		Dsn:         dsn,
+		Environment: os.Getenv("ENV_MODE"),
+		Debug:       true,
+	})
+	if err != nil {
+		log.Printf("Sentry initialization failed: %v\n", err)
+	}
+	defer sentry.Flush(2 * time.Second)
+
 	database.ConnectDB()
 
 	r := gin.Default()
 
+	// Pasang Sentry Gin Middleware resmi di awal router
+	r.Use(sentrygin.New(sentrygin.Options{
+		Repanic: true,
+	}))
 
 	r.Use(cors.New(cors.Config{
 		AllowOrigins: []string{
