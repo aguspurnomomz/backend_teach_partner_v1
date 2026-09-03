@@ -6,12 +6,13 @@ import (
 	"time"
 
 	"github.com/getsentry/sentry-go"
-	sentrygin "github.com/getsentry/sentry-go/gin"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"teach_partner_dev/database"
 	"teach_partner_dev/routes"
+
+	sentrygin "github.com/getsentry/sentry-go/gin"
 )
 
 func main() {
