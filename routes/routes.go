@@ -557,7 +557,9 @@ func SetupRoutes(r *gin.Engine) {
 				SubmittedAt   time.Time `json:"submitted_at"`
 			}
 
-			var submissions []SubmissionItem
+			// Inisialisasi slice dengan make() agar output JSON berupa [] alih-alih null
+			submissions := make([]SubmissionItem, 0)
+			
 			for rows.Next() {
 				var s SubmissionItem
 				if err := rows.Scan(&s.ID, &s.StudentName, &s.StudentNumber, &s.NISN, &s.Score, &s.SubmittedAt); err == nil {
