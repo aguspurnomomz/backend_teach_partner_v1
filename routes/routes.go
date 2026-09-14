@@ -281,6 +281,7 @@ func SetupRoutes(r *gin.Engine) {
 			return
 		}
 
+		// Siapkan string lokasi untuk database & WhatsApp
 		lokasiStr := "Tidak diizinkan / Tidak tersedia"
 		mapsLink := "Tidak tersedia"
 		if req.Location != nil {
@@ -290,6 +291,7 @@ func SetupRoutes(r *gin.Engine) {
 				req.Location.Latitude, req.Location.Longitude)
 		}
 
+		// 1. Cek apakah akun sedang diblokir sementara
 		if lockedUntil.Valid && lockedUntil.Time.After(time.Now()) {
 			sisaWaktu := int(time.Until(lockedUntil.Time).Seconds())
 			c.JSON(http.StatusLocked, gin.H{
@@ -298,6 +300,7 @@ func SetupRoutes(r *gin.Engine) {
 			return
 		}
 
+		// 2. Validasi Password
 		err = bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(req.Password))
 		if err != nil {
 			failedAttempts++
@@ -319,6 +322,7 @@ func SetupRoutes(r *gin.Engine) {
 					go sendWhatsAppNotification(waNumber.String, pesanAlert)
 				}
 
+				// Menyimpan lokasi pada log LOGIN_LOCKED
 				logSuperAdminActivity(adminID, "LOGIN_LOCKED", c.ClientIP(), c.Request.UserAgent(), lokasiStr, "Akun dikunci 1 menit karena 3x salah password")
 				c.JSON(http.StatusLocked, gin.H{"error": "Terlalu banyak percobaan gagal. Akun dikunci sementara selama 1 menit."})
 				return
@@ -327,18 +331,34 @@ func SetupRoutes(r *gin.Engine) {
 					`UPDATE super_admins SET failed_login_attempts = $1 WHERE id = $2`,
 					failedAttempts, adminID,
 				)
+				// Menyimpan lokasi pada log LOGIN_FAILED
 				logSuperAdminActivity(adminID, "LOGIN_FAILED", c.ClientIP(), c.Request.UserAgent(), lokasiStr, "Password salah")
 				c.JSON(http.StatusUnauthorized, gin.H{"error": fmt.Sprintf("Kata sandi salah! Sisa percobaan: %d", 3-failedAttempts)})
 				return
 			}
 		}
 
+		// 3. Jika Login Berhasil, Reset Counter Gagal & Locked
 		_, _ = database.DB.Exec(
 			`UPDATE super_admins SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1`,
 			adminID,
 		)
 
 		logSuperAdminActivity(adminID, "LOGIN_SUCCESS", c.ClientIP(), c.Request.UserAgent(), lokasiStr, "Login berhasil")
+
+		if waNumber.Valid && waNumber.String != "" {
+			ipClient := c.ClientIP()
+			userAgent := c.Request.UserAgent()
+
+			pesanWA := fmt.Sprintf(
+				"INFORMASI LOGIN SUPERADMIN\n\nAkun Superadmin Anda baru saja masuk pada %s.\n\nDetail Akses:\n- Lokasi (Koordinat): %s\n- Alamat IP: %s\n- Perangkat: %s\n\nJika ini bukan Anda, segera amankan akun Anda!", 
+				time.Now().Format("02-01-2006 15:04:05"), 
+				mapsLink, 
+				ipClient, 
+				userAgent,
+			)
+			go sendWhatsAppNotification(waNumber.String, pesanWA)
+		}
 
 		jwtSecret := os.Getenv("JWT_ADMIN_SECRET")
 		if jwtSecret == "" {
@@ -417,159 +437,267 @@ func SetupRoutes(r *gin.Engine) {
 
 			c.JSON(http.StatusOK, gin.H{"logs": logs})
 		})
-	}
 
-	// ==========================================
-	// --- ROUTE PUBLIK (apiPub) ---
-	// ==========================================
-	apiPub := r.Group("/api")
-	{
-		// 1. Ambil daftar bank soal (Mode Uji Coba Lokal)
-		apiPub.GET("/my-question-banks", func(c *gin.Context) {
+		adminApi.POST("/change-password", func(c *gin.Context) {
+			adminIDVal, exists := c.Get("admin_id")
+			if !exists {
+				email := c.MustGet("admin_email").(string)
+				err := database.DB.QueryRow(`SELECT id FROM super_admins WHERE email = $1`, email).Scan(&adminIDVal)
+				if err != nil {
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "Sesi admin tidak dikenali"})
+					return
+				}
+			}
+			adminID := int(adminIDVal.(float64))
+
+			var req ChangePasswordRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format input tidak valid (minimal 6 karakter): " + err.Error()})
+				return
+			}
+
+			var currentHash string
+			var waNumber sql.NullString
+			err := database.DB.QueryRow(`SELECT password_hash, no_whatsapp FROM super_admins WHERE id = $1`, adminID).Scan(&currentHash, &waNumber)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Data admin tidak ditemukan"})
+				return
+			}
+
+			err = bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(req.OldPassword))
+			if err != nil {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Kata sandi lama salah!"})
+				return
+			}
+
+			newHashBytes, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memproses kata sandi baru"})
+				return
+			}
+
+			_, err = database.DB.Exec(`UPDATE super_admins SET password_hash = $1, updated_at = NOW() WHERE id = $2`, string(newHashBytes), adminID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan kata sandi baru"})
+				return
+			}
+
+			lokasiStr := "Tidak diizinkan / Tidak tersedia"
+			if req.Location != nil {
+				lokasiStr = fmt.Sprintf("%.6f, %.6f", req.Location.Latitude, req.Location.Longitude)
+			}
+
+			logSuperAdminActivity(adminID, "CHANGE_PASSWORD", c.ClientIP(), c.Request.UserAgent(), lokasiStr, "Berhasil mengubah kata sandi")
+			if waNumber.Valid && waNumber.String != "" {
+					mapsLink := "Tidak tersedia"
+						if req.Location != nil {
+							mapsLink = fmt.Sprintf("%.6f, %.6f (https://maps.google.com/?q=%.6f,%.6f)", 
+								req.Location.Latitude, req.Location.Longitude, 
+								req.Location.Latitude, req.Location.Longitude)
+						}
+
+					pesanWA := fmt.Sprintf(
+							"PERINGATAN KEAMANAN\n\nKata sandi akun Superadmin Anda baru saja diubah pada %s.\n\nDetail Akses:\n- Lokasi: %s\n\nJika Anda tidak merasa melakukan ini, segera amankan akun Anda!", 
+							time.Now().Format("02-01-2006 15:04:05"), 
+							mapsLink,
+						)
+					go sendWhatsAppNotification(waNumber.String, pesanWA)
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Kata sandi berhasil diperbarui"})
+		})
+
+		adminApi.GET("/registered-users", func(c *gin.Context) {
 			rows, err := database.DB.Query(`
-				SELECT id, title, subject, phase, created_at 
-				FROM question_banks 
-				ORDER BY created_at DESC
-				LIMIT 10
+				SELECT id, nama_guru, nip_guru, nama_sekolah, mata_pelajaran, token_balance, is_active, last_login, updated_at 
+				FROM profiles 
+				ORDER BY updated_at DESC
 			`)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil daftar bank soal"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data pengguna: " + err.Error()})
 				return
 			}
 			defer rows.Close()
 
-			type BankItem struct {
-				ID        string    `json:"id"`
-				Title     string    `json:"title"`
-				Subject   string    `json:"subject"`
-				Phase     string    `json:"phase"`
-				CreatedAt time.Time `json:"created_at"`
+			type UserListItem struct {
+				ID            string     `json:"id"`
+				NamaGuru      string     `json:"nama_guru"`
+				NipGuru       string     `json:"nip_guru"`
+				NamaSekolah   string     `json:"nama_sekolah"`
+				MataPelajaran string     `json:"mata_pelajaran"`
+				TokenBalance  int        `json:"token_balance"`
+				IsActive      bool       `json:"is_active"`
+				LastLogin     *time.Time `json:"last_login"`
+				UpdatedAt     time.Time  `json:"updated_at"`
 			}
 
-			var banks []BankItem
+			var users []UserListItem
 			for rows.Next() {
-				var b BankItem
-				if err := rows.Scan(&b.ID, &b.Title, &b.Subject, &b.Phase, &b.CreatedAt); err == nil {
-					banks = append(banks, b)
+				var u UserListItem
+				var namaGuru, nipGuru, namaSekolah, mataPelajaran sql.NullString
+				var lastLogin sql.NullTime
+				var updatedAt time.Time
+
+				err := rows.Scan(&u.ID, &namaGuru, &nipGuru, &namaSekolah, &mataPelajaran, &u.TokenBalance, &u.IsActive, &lastLogin, &updatedAt)
+				if err != nil {
+					continue
 				}
+
+				u.NamaGuru = namaGuru.String
+				u.NipGuru = nipGuru.String
+				u.NamaSekolah = namaSekolah.String
+				u.MataPelajaran = mataPelajaran.String
+				if lastLogin.Valid {
+					u.LastLogin = &lastLogin.Time
+				}
+				u.UpdatedAt = updatedAt
+
+				users = append(users, u)
 			}
 
-			c.JSON(http.StatusOK, gin.H{"question_banks": banks})
+			c.JSON(http.StatusOK, gin.H{
+				"total_users": len(users),
+				"users":       users,
+			})
 		})
 
-		// 2. Buat Sesi Ujian QR
-		apiPub.POST("/exam-sessions", func(c *gin.Context) {
-			var req CreateExamSessionRequest
+		adminApi.PATCH("/users/:id/status", func(c *gin.Context) {
+			userID := c.Param("id")
+			var req UpdateUserStatusRequest
+
 			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Data sesi ujian tidak valid: " + err.Error()})
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format data tidak valid: " + err.Error()})
 				return
 			}
 
-			qrToken := randString(12)
-			expiresAt := time.Now().Add(time.Hour * 3)
-
-			durasi := req.DurationMinutes
-			if durasi <= 0 {
-				durasi = 60
-			}
-
-			var defaultUserID string
-			err := database.DB.QueryRow(`SELECT id FROM profiles LIMIT 1`).Scan(&defaultUserID)
-			if err != nil || defaultUserID == "" {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Tidak ada data profil guru ditemukan di tabel profiles"})
-				return
-			}
-
-			var sessionID string
-			queryExec := `INSERT INTO exam_sessions (user_id, title, question_bank_id, qr_code_token, duration_minutes, expires_at) 
-			              VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`
-
-			err = database.DB.QueryRow(queryExec, defaultUserID, req.Title, req.QuestionBankID, qrToken, durasi, expiresAt).Scan(&sessionID)
+			query := `UPDATE profiles SET is_active = $1, updated_at = NOW() WHERE id = $2`
+			result, err := database.DB.Exec(query, req.IsActive, userID)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat sesi ujian di database: " + err.Error()})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memperbarui status pengguna: " + err.Error()})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Pengguna tidak ditemukan"})
+				return
+			}
+
+			statusText := "diaktifkan"
+			if !req.IsActive {
+				statusText = "diblokir"
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":   fmt.Sprintf("Pengguna berhasil %s", statusText),
+				"user_id":   userID,
+				"is_active": req.IsActive,
+			})
+		})
+
+		adminApi.GET("/ebooks", func(c *gin.Context) {
+			rows, err := database.DB.Query(`
+				SELECT id, judul, jenjang, mata_pelajaran, kategori, cover_url, file_url, created_at 
+				FROM ebooks 
+				ORDER BY created_at DESC
+			`)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data e-book: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type EbookItem struct {
+				ID            string    `json:"id"`
+				Judul         string    `json:"judul"`
+				Jenjang       string    `json:"jenjang"`
+				MataPelajaran string    `json:"mata_pelajaran"`
+				Kategori      string    `json:"kategori"`
+				CoverUrl      string    `json:"cover_url"`
+				FileUrl       string    `json:"file_url"`
+				CreatedAt     time.Time `json:"created_at"`
+			}
+
+			var ebooks []EbookItem
+			for rows.Next() {
+				var e EbookItem
+				var coverUrl sql.NullString
+				
+				err := rows.Scan(&e.ID, &e.Judul, &e.Jenjang, &e.MataPelajaran, &e.Kategori, &coverUrl, &e.FileUrl, &e.CreatedAt)
+				if err != nil {
+					continue
+				}
+				e.CoverUrl = coverUrl.String
+				ebooks = append(ebooks, e)
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"total_ebooks": len(ebooks),
+				"ebooks":       ebooks,
+			})
+		})
+
+		adminApi.POST("/ebooks", func(c *gin.Context) {
+			var req CreateEbookRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format data e-book tidak valid: " + err.Error()})
+				return
+			}
+
+			var ebookID string
+			query := `INSERT INTO ebooks (judul, jenjang, mata_pelajaran, kategori, cover_url, file_url) 
+			          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`
+			
+			err := database.DB.QueryRow(query, req.Judul, req.Jenjang, req.MataPelajaran, req.Kategori, req.CoverUrl, req.FileUrl).Scan(&ebookID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan e-book ke database: " + err.Error()})
 				return
 			}
 
 			c.JSON(http.StatusCreated, gin.H{
-				"message":          "Sesi ujian berhasil dibuat",
-				"session_id":       sessionID,
-				"qr_code_token":    qrToken,
-				"duration_minutes": durasi,
+				"message":  "E-book berhasil ditambahkan",
+				"ebook_id": ebookID,
 			})
 		})
 
-		// 3. Endpoint Daftar Sesi Ujian Aktif
-		apiPub.GET("/exam-sessions", func(c *gin.Context) {
-			rows, err := database.DB.Query(`
-				SELECT id, title, qr_code_token, duration_minutes, is_active, created_at 
-				FROM exam_sessions 
-				WHERE deleted_at IS NULL
-				ORDER BY created_at DESC
-			`)
+		adminApi.DELETE("/ebooks/:id", func(c *gin.Context) {
+			ebookID := c.Param("id")
+
+			var judulBuku string
+			_ = database.DB.QueryRow(`SELECT judul FROM ebooks WHERE id = $1`, ebookID).Scan(&judulBuku)
+
+			query := `DELETE FROM ebooks WHERE id = $1`
+			result, err := database.DB.Exec(query, ebookID)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat daftar sesi ujian"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus e-book: " + err.Error()})
 				return
 			}
-			defer rows.Close()
 
-			type SessionItem struct {
-				ID              string    `json:"id"`
-				Title           string    `json:"title"`
-				QRCodeToken     string    `json:"qr_code_token"`
-				DurationMinutes int       `json:"duration_minutes"`
-				IsActive        bool      `json:"is_active"`
-				CreatedAt       time.Time `json:"created_at"`
-			}
-
-			var sessions []SessionItem
-			for rows.Next() {
-				var s SessionItem
-				if err := rows.Scan(&s.ID, &s.Title, &s.QRCodeToken, &s.DurationMinutes, &s.IsActive, &s.CreatedAt); err == nil {
-					sessions = append(sessions, s)
-				}
-			}
-
-			c.JSON(http.StatusOK, gin.H{"sessions": sessions})
-		})
-
-		// 4. Endpoint Log Monitoring Siswa per Sesi
-		apiPub.GET("/exam-sessions/:id/submissions", func(c *gin.Context) {
-			sessionID := c.Param("id")
-
-			rows, err := database.DB.Query(`
-				SELECT id, student_name, student_number, nisn, score, submitted_at 
-				FROM exam_submissions 
-				WHERE exam_session_id = $1 
-				ORDER BY submitted_at DESC
-			`, sessionID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat data log monitoring"})
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "E-book tidak ditemukan"})
 				return
 			}
-			defer rows.Close()
 
-			type SubmissionItem struct {
-				ID            string    `json:"id"`
-				StudentName   string    `json:"student_name"`
-				StudentNumber string    `json:"student_number"`
-				NISN          string    `json:"nisn"`
-				Score         float64   `json:"score"`
-				SubmittedAt   time.Time `json:"submitted_at"`
+			adminIDVal, _ := c.Get("admin_id")
+			if adminIDVal != nil {
+				adminID := int(adminIDVal.(float64))
+				logSuperAdminActivity(adminID, "DELETE_EBOOK", c.ClientIP(), c.Request.UserAgent(), "", fmt.Sprintf("Menghapus e-book: %s", judulBuku))
 			}
 
-			// Inisialisasi slice dengan make() agar output JSON berupa [] alih-alih null
-			submissions := make([]SubmissionItem, 0)
-			
-			for rows.Next() {
-				var s SubmissionItem
-				if err := rows.Scan(&s.ID, &s.StudentName, &s.StudentNumber, &s.NISN, &s.Score, &s.SubmittedAt); err == nil {
-					submissions = append(submissions, s)
-				}
-			}
-
-			c.JSON(http.StatusOK, gin.H{"submissions": submissions})
+			c.JSON(http.StatusOK, gin.H{
+				"message":  "E-book berhasil dihapus",
+				"ebook_id": ebookID,
+			})
 		})
+	}
 
+	// ==========================================
+	// --- ROUTE PUBLIK (apiPub) ---
+	// Endpoint yang diakses siswa (tidak butuh token guru)
+	// ==========================================
+	apiPub := r.Group("/api")
+	{
 		// 5. Endpoint Siswa Memuat Soal Berdasarkan Token QR
 		apiPub.GET("/exam/session-questions", func(c *gin.Context) {
 			token := c.Query("token")
@@ -581,15 +709,14 @@ func SetupRoutes(r *gin.Engine) {
 			var sessionID, examTitle string
 			var questionBankID sql.NullString
 			
-			// Longgarkan pengecekan dengan mengabaikan status is_active untuk sementara waktu selama testing lokal
 			err := database.DB.QueryRow(`
 				SELECT id, title, question_bank_id 
 				FROM exam_sessions 
-				WHERE qr_code_token = $1 OR id::text = $1
+				WHERE (qr_code_token = $1 OR id::text = $1) AND deleted_at IS NULL
 			`, token).Scan(&sessionID, &examTitle, &questionBankID)
 
 			if err != nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak ditemukan atau QR Code tidak valid (Token: " + token + ")"})
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak ditemukan atau QR Code tidak valid"})
 				return
 			}
 
@@ -730,7 +857,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
-		// Endpoint untuk mengecek apakah NISN sudah pernah mengerjakan ujian pada sesi ini
+		// Endpoint Cek Status Siswa
 		apiPub.GET("/exam/check-student", func(c *gin.Context) {
 			sessionID := c.Query("session_id")
 			nisn := c.Query("nisn")
@@ -752,90 +879,11 @@ func SetupRoutes(r *gin.Engine) {
 
 			c.JSON(http.StatusOK, gin.H{"has_submitted": false})
 		})
-
-		// Endpoint Pindahkan Sesi ke Trash Bin (Soft Delete)
-		apiPub.DELETE("/exam-sessions/:id", func(c *gin.Context) {
-			sessionID := c.Param("id")
-
-			result, err := database.DB.Exec(`
-				UPDATE exam_sessions SET deleted_at = NOW(), is_active = FALSE WHERE id = $1
-			`, sessionID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus sesi ujian"})
-				return
-			}
-
-			rowsAffected, _ := result.RowsAffected()
-			if rowsAffected == 0 {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak ditemukan"})
-				return
-			}
-
-			c.JSON(http.StatusOK, gin.H{"message": "Sesi ujian berhasil dipindahkan ke tempat sampah (Trash Bin)"})
-		})
-		// Endpoint Daftar Sesi di Trash Bin
-		apiPub.GET("/exam-sessions/trash", func(c *gin.Context) {
-			rows, err := database.DB.Query(`
-				SELECT id, title, qr_code_token, duration_minutes, is_active, created_at, deleted_at 
-				FROM exam_sessions 
-				WHERE deleted_at IS NOT NULL
-				ORDER BY deleted_at DESC
-			`)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat data tempat sampah"})
-				return
-			}
-			defer rows.Close()
-
-			type TrashItem struct {
-				ID              string     `json:"id"`
-				Title           string     `json:"title"`
-				QRCodeToken     string     `json:"qr_code_token"`
-				DurationMinutes int        `json:"duration_minutes"`
-				IsActive        bool       `json:"is_active"`
-				CreatedAt       time.Time  `json:"created_at"`
-				DeletedAt       *time.Time `json:"deleted_at"`
-			}
-
-			var trashes []TrashItem
-			for rows.Next() {
-				var t TrashItem
-				var deletedAt sql.NullTime
-				if err := rows.Scan(&t.ID, &t.Title, &t.QRCodeToken, &t.DurationMinutes, &t.IsActive, &t.CreatedAt, &deletedAt); err == nil {
-					if deletedAt.Valid {
-						t.DeletedAt = &deletedAt.Time
-					}
-					trashes = append(trashes, t)
-				}
-			}
-
-			c.JSON(http.StatusOK, gin.H{"trash_sessions": trashes})
-		})
-
-		// Endpoint Memulihkan Sesi dari Trash Bin
-		apiPub.POST("/exam-sessions/:id/restore", func(c *gin.Context) {
-			sessionID := c.Param("id")
-
-			result, err := database.DB.Exec(`
-				UPDATE exam_sessions SET deleted_at = NULL, is_active = TRUE WHERE id = $1
-			`, sessionID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memulihkan sesi ujian"})
-				return
-			}
-
-			rowsAffected, _ := result.RowsAffected()
-			if rowsAffected == 0 {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak ditemukan di tempat sampah"})
-				return
-			}
-
-			c.JSON(http.StatusOK, gin.H{"message": "Sesi ujian berhasil dipulihkan"})
-		})
 	}
 
 	// ==========================================
 	// --- ROUTE TERPROTEKSI (api) ---
+	// Wajib Auth: Hanya guru yang login yang bisa mengakses data miliknya sendiri
 	// ==========================================
 	api := r.Group("/api")
 	api.Use(middleware.AuthMiddleware())
@@ -1005,6 +1053,7 @@ func SetupRoutes(r *gin.Engine) {
             c.JSON(http.StatusOK, gin.H{"message": "Identitas perangkat berhasil diperbarui"})
 		})
 
+		// Bank Soal: Simpan berdasarkan user_id guru yang login
 		api.POST("/question-banks", func(c *gin.Context) {
 			userID, _ := c.Get("user_id")
 
@@ -1063,6 +1112,255 @@ func SetupRoutes(r *gin.Engine) {
 				"message": "Bank soal dan butir soal berhasil dibuat",
 				"bank_id": bankID,
 			})
+		})
+
+		// Bank Soal: Hanya ambil milik guru yang login
+		api.GET("/my-question-banks", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT id, title, subject, phase, created_at 
+				FROM question_banks 
+				WHERE user_id = $1 
+				ORDER BY created_at DESC
+			`, userID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil daftar bank soal"})
+				return
+			}
+			defer rows.Close()
+
+			type BankItem struct {
+				ID        string    `json:"id"`
+				Title     string    `json:"title"`
+				Subject   string    `json:"subject"`
+				Phase     string    `json:"phase"`
+				CreatedAt time.Time `json:"created_at"`
+			}
+
+			var banks []BankItem
+			for rows.Next() {
+				var b BankItem
+				if err := rows.Scan(&b.ID, &b.Title, &b.Subject, &b.Phase, &b.CreatedAt); err == nil {
+					banks = append(banks, b)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"question_banks": banks})
+		})
+
+		// Buat Sesi Ujian: Simpan user_id guru yang sedang login
+		api.POST("/exam-sessions", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var req CreateExamSessionRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Data sesi ujian tidak valid: " + err.Error()})
+				return
+			}
+
+			qrToken := randString(12)
+			expiresAt := time.Now().Add(time.Hour * 3)
+
+			durasi := req.DurationMinutes
+			if durasi <= 0 {
+				durasi = 60
+			}
+
+			var sessionID string
+			queryExec := `INSERT INTO exam_sessions (user_id, title, question_bank_id, qr_code_token, duration_minutes, expires_at) 
+			              VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`
+
+			err := database.DB.QueryRow(queryExec, userID, req.Title, req.QuestionBankID, qrToken, durasi, expiresAt).Scan(&sessionID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat sesi ujian di database: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message":          "Sesi ujian berhasil dibuat",
+				"session_id":       sessionID,
+				"qr_code_token":    qrToken,
+				"duration_minutes": durasi,
+			})
+		})
+
+		// Daftar Sesi Ujian Aktif: Hanya miliki guru yang login
+		api.GET("/exam-sessions", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT id, title, qr_code_token, duration_minutes, is_active, created_at 
+				FROM exam_sessions 
+				WHERE user_id = $1 AND deleted_at IS NULL
+				ORDER BY created_at DESC
+			`, userID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat daftar sesi ujian"})
+				return
+			}
+			defer rows.Close()
+
+			type SessionItem struct {
+				ID              string    `json:"id"`
+				Title           string    `json:"title"`
+				QRCodeToken     string    `json:"qr_code_token"`
+				DurationMinutes int       `json:"duration_minutes"`
+				IsActive        bool      `json:"is_active"`
+				CreatedAt       time.Time `json:"created_at"`
+			}
+
+			var sessions []SessionItem
+			for rows.Next() {
+				var s SessionItem
+				if err := rows.Scan(&s.ID, &s.Title, &s.QRCodeToken, &s.DurationMinutes, &s.IsActive, &s.CreatedAt); err == nil {
+					sessions = append(sessions, s)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"sessions": sessions})
+		})
+
+		// Log Monitoring Siswa: Validasi bahwa sesi tersebut milik guru yang login
+		api.GET("/exam-sessions/:id/submissions", func(c *gin.Context) {
+			userID, _ := c.Get("user_id")
+			sessionID := c.Param("id")
+
+			// Pastikan sesi ini benar milik guru yang bersangkutan
+			var ownerID string
+			err := database.DB.QueryRow(`SELECT user_id FROM exam_sessions WHERE id = $1`, sessionID).Scan(&ownerID)
+			if err != nil || ownerID != userID {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak! Sesi ujian bukan milik Anda."})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT id, student_name, student_number, nisn, score, submitted_at 
+				FROM exam_submissions 
+				WHERE exam_session_id = $1 
+				ORDER BY submitted_at DESC
+			`, sessionID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat data log monitoring"})
+				return
+			}
+			defer rows.Close()
+
+			type SubmissionItem struct {
+				ID            string    `json:"id"`
+				StudentName   string    `json:"student_name"`
+				StudentNumber string    `json:"student_number"`
+				NISN          string    `json:"nisn"`
+				Score         float64   `json:"score"`
+				SubmittedAt   time.Time `json:"submitted_at"`
+			}
+
+			submissions := make([]SubmissionItem, 0)
+			for rows.Next() {
+				var s SubmissionItem
+				if err := rows.Scan(&s.ID, &s.StudentName, &s.StudentNumber, &s.NISN, &s.Score, &s.SubmittedAt); err == nil {
+					submissions = append(submissions, s)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"submissions": submissions})
+		})
+
+		// Hapus Sesi (Soft Delete ke Trash Bin): Pastikan milik guru yang login
+		api.DELETE("/exam-sessions/:id", func(c *gin.Context) {
+			userID, _ := c.Get("user_id")
+			sessionID := c.Param("id")
+
+			result, err := database.DB.Exec(`
+				UPDATE exam_sessions SET deleted_at = NOW(), is_active = FALSE WHERE id = $1 AND user_id = $2
+			`, sessionID, userID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus sesi ujian"})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak ditemukan atau bukan milik Anda"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Sesi ujian berhasil dipindahkan ke tempat sampah (Trash Bin)"})
+		})
+
+		// Trash Bin List: Hanya sesi yang dihapus milik guru yang login
+		api.GET("/exam-sessions/trash", func(c *gin.Context) {
+			userID, _ := c.Get("user_id")
+
+			rows, err := database.DB.Query(`
+				SELECT id, title, qr_code_token, duration_minutes, is_active, created_at, deleted_at 
+				FROM exam_sessions 
+				WHERE user_id = $1 AND deleted_at IS NOT NULL
+				ORDER BY deleted_at DESC
+			`, userID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat data tempat sampah"})
+				return
+			}
+			defer rows.Close()
+
+			type TrashItem struct {
+				ID              string     `json:"id"`
+				Title           string     `json:"title"`
+				QRCodeToken     string     `json:"qr_code_token"`
+				DurationMinutes int        `json:"duration_minutes"`
+				IsActive        bool       `json:"is_active"`
+				CreatedAt       time.Time  `json:"created_at"`
+				DeletedAt       *time.Time `json:"deleted_at"`
+			}
+
+			trashes := make([]TrashItem, 0)
+			for rows.Next() {
+				var t TrashItem
+				var deletedAt sql.NullTime
+				if err := rows.Scan(&t.ID, &t.Title, &t.QRCodeToken, &t.DurationMinutes, &t.IsActive, &t.CreatedAt, &deletedAt); err == nil {
+					if deletedAt.Valid {
+						t.DeletedAt = &deletedAt.Time
+					}
+					trashes = append(trashes, t)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"trash_sessions": trashes})
+		})
+
+		// Restore Sesi dari Trash Bin: Pastikan milik guru yang login
+		api.POST("/exam-sessions/:id/restore", func(c *gin.Context) {
+			userID, _ := c.Get("user_id")
+			sessionID := c.Param("id")
+
+			result, err := database.DB.Exec(`
+				UPDATE exam_sessions SET deleted_at = NULL, is_active = TRUE WHERE id = $1 AND user_id = $2
+			`, sessionID, userID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memulihkan sesi ujian"})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak ditemukan di tempat sampah"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Sesi ujian berhasil dipulihkan"})
 		})
 
 		api.POST("/ai/generate-questions", func(c *gin.Context) {
