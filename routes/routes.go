@@ -51,6 +51,7 @@ type CreateSchoolRequest struct {
 	SchoolName string `json:"school_name" binding:"required"`
 	Npsn       string `json:"npsn" binding:"required"`
 	Address    string `json:"address"`
+	Jenjang    string `json:"jenjang" binding:"required"` 
 }
 
 type AcademicYearRequest struct {
@@ -66,6 +67,16 @@ type UpdateSchoolProfileRequest struct {
 	Address    string `json:"address"`
 	City       string `json:"city"`
 	Email      string `json:"email"`
+}
+
+type CreateClassGroupRequest struct {
+	Name           string `json:"name" binding:"required"`
+	Level          string `json:"level" binding:"required"`
+	Major          string `json:"major"`
+	ClassType      string `json:"class_type"`
+	Mapping        string `json:"mapping"`
+	Quota          int    `json:"quota"`
+	AcademicYearID string `json:"academic_year_id" binding:"required"`
 }
 
 // --- Struct Pembelian Token & Midtrans ---
@@ -780,10 +791,10 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			// Simpan sekolah baru ke database
+			// Simpan sekolah baru beserta jenjangnya ke database
 			var schoolID string
-			query := `INSERT INTO schools (school_name, npsn, address, is_active) VALUES ($1, $2, $3, TRUE) RETURNING id`
-			err = database.DB.QueryRow(query, req.SchoolName, req.Npsn, req.Address).Scan(&schoolID)
+			query := `INSERT INTO schools (school_name, npsn, address, jenjang, is_active) VALUES ($1, $2, $3, $4, TRUE) RETURNING id`
+			err = database.DB.QueryRow(query, req.SchoolName, req.Npsn, req.Address, req.Jenjang).Scan(&schoolID)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan data sekolah ke database: " + err.Error()})
 				return
@@ -1938,11 +1949,14 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			// Ambil school_id berdasarkan user_id dari tabel school_admins
+			// Debugging: Cetak userID ke terminal Go
+			fmt.Printf("DEBUG userID yang mencoba akses academic-years: %v\n", userID)
+
 			var schoolID string
 			err := database.DB.QueryRow(`SELECT school_id FROM school_admins WHERE id = $1 AND is_active = TRUE`, userID).Scan(&schoolID)
 			if err != nil {
-				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak: Anda bukan admin sekolah yang aktif"})
+				fmt.Printf("DEBUG Error ambil school_id: %v\n", err) // <-- Lihat error ini di terminal Go Anda
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak: Data admin sekolah tidak valid atau tidak aktif"})
 				return
 			}
 
@@ -2122,6 +2136,135 @@ func SetupRoutes(r *gin.Engine) {
 			}
 
 			c.JSON(http.StatusOK, gin.H{"message": "Profil sekolah berhasil diperbarui"})
+		})
+
+		// Endpoint Admin Sekolah: Mengambil Daftar Kelas
+		api.GET("/school-admin/classes", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var schoolID, schoolName string
+			err := database.DB.QueryRow(`
+				SELECT sa.school_id, s.school_name 
+				FROM school_admins sa 
+				JOIN schools s ON sa.school_id = s.id 
+				WHERE sa.id = $1 AND sa.is_active = TRUE
+			`, userID).Scan(&schoolID, &schoolName)
+			
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak: Anda bukan admin sekolah yang aktif"})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT cg.id, cg.name, cg.level, COALESCE(cg.class_type, 'Umum'), 
+				       COALESCE(cg.mapping, ''), COALESCE(cg.quota, 0), cg.academic_year_id, 
+				       COALESCE(say.name, '-'), COALESCE(say.semester, '-'), cg.created_at
+				FROM class_groups cg
+				LEFT JOIN school_academic_years say ON cg.academic_year_id = say.id
+				WHERE cg.school_id = $1
+				ORDER BY cg.created_at DESC
+			`, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data kelas"})
+				return
+			}
+			defer rows.Close()
+
+			type ClassItem struct {
+				ID               string    `json:"id"`
+				SchoolName       string    `json:"school_name"`
+				Name             string    `json:"name"`
+				Level            string    `json:"level"`
+				ClassType        string    `json:"class_type"`
+				Mapping          string    `json:"mapping"`
+				Quota            int       `json:"quota"`
+				AcademicYearID   string    `json:"academic_year_id"`
+				AcademicYearName string    `json:"academic_year_name"`
+				Semester         string    `json:"semester"`
+				CreatedAt        time.Time `json:"created_at"`
+			}
+
+			var classes []ClassItem
+			for rows.Next() {
+				var cl ClassItem
+				cl.SchoolName = schoolName
+				if err := rows.Scan(&cl.ID, &cl.Name, &cl.Level, &cl.ClassType, &cl.Mapping, &cl.Quota, &cl.AcademicYearID, &cl.AcademicYearName, &cl.Semester, &cl.CreatedAt); err == nil {
+					classes = append(classes, cl)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"classes": classes})
+		})
+
+		// Endpoint Admin Sekolah: Menambah Kelas Baru
+		api.POST("/school-admin/classes", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var schoolID string
+			err := database.DB.QueryRow(`SELECT school_id FROM school_admins WHERE id = $1 AND is_active = TRUE`, userID).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak: Anda bukan admin sekolah yang aktif"})
+				return
+			}
+
+			var req CreateClassGroupRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format data tidak valid: " + err.Error()})
+				return
+			}
+
+			var classID string
+			err = database.DB.QueryRow(`
+				INSERT INTO class_groups (school_id, academic_year_id, name, level, class_type, mapping, quota)
+				VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7)
+				RETURNING id
+			`, schoolID, req.AcademicYearID, req.Name, req.Level, req.ClassType, req.Mapping, req.Quota).Scan(&classID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan data kelas: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{"message": "Kelas berhasil ditambahkan", "id": classID})
+		})
+
+		// Endpoint Admin Sekolah: Menghapus Kelas
+		api.DELETE("/school-admin/classes/:id", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var schoolID string
+			err := database.DB.QueryRow(`SELECT school_id FROM school_admins WHERE id = $1 AND is_active = TRUE`, userID).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak: Anda bukan admin sekolah yang aktif"})
+				return
+			}
+
+			classID := c.Param("id")
+			result, err := database.DB.Exec(`DELETE FROM class_groups WHERE id = $1 AND school_id = $2`, classID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus kelas"})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Kelas tidak ditemukan atau bukan milik institusi Anda"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Kelas berhasil dihapus"})
 		})
 	}
 }
