@@ -16,6 +16,7 @@ func ConnectDB() {
 	if dsn == "" {
 		log.Fatal("SUPABASE_DB_URL belum diatur di file .env")
 	}
+	
 
 	var err error
 	DB, err = sql.Open("postgres", dsn)

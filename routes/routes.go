@@ -1295,21 +1295,79 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			// Cek tabel school_admins berdasarkan user_id ATAU email yang sedang login
-			var userType string
-			err := database.DB.QueryRow(`
-				SELECT user_type FROM school_admins 
-				WHERE (id = $1 OR email = (SELECT email FROM auth.users WHERE id = $1)) 
-				AND is_active = TRUE
-			`, userID).Scan(&userType)
+			// Safe conversion userID ke string
+			var userIDStr string
+			switch v := userID.(type) {
+			case string:
+				userIDStr = v
+			case fmt.Stringer:
+				userIDStr = v.String()
+			default:
+				userIDStr = fmt.Sprintf("%v", v)
+			}
+
+			fmt.Printf("[check-role] userID=%s\n", userIDStr)
+
+			// ==========================================
+			// 1. Ambil email user dari auth.users
+			// ==========================================
+			var userEmail string
+			err := database.DB.QueryRow(
+				`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`,
+				userIDStr,
+			).Scan(&userEmail)
 
 			if err != nil {
-				// Jika tidak ditemukan di school_admins, berarti dia guru biasa (user)
-				c.JSON(http.StatusOK, gin.H{"role": "teacher"})
+				fmt.Printf("[check-role] Gagal ambil email dari auth.users: %v\n", err)
+				// fallback ke context
+				if emailFromCtx, ok := c.Get("email"); ok {
+					userEmail, _ = emailFromCtx.(string)
+				}
+			}
+			fmt.Printf("[check-role] email=%s\n", userEmail)
+
+			// ==========================================
+			// 2. Cek apakah user adalah school_admin
+			// ==========================================
+			var userType string
+			err = database.DB.QueryRow(`
+				SELECT user_type FROM school_admins 
+				WHERE (id = $1 OR (email <> '' AND email = $2)) 
+				AND is_active = TRUE
+			`, userIDStr, userEmail).Scan(&userType)  // ← PASTIKAN 2 ARGUMEN!
+
+			if err == nil {
+				fmt.Printf("[check-role] User adalah school_admin (%s)\n", userType)
+
+				// Pastikan row profiles juga ada
+				_, _ = database.DB.Exec(`
+					INSERT INTO profiles (id, email_sekolah, token_balance, is_active, updated_at)
+					VALUES ($1, $2, 0, TRUE, NOW())
+					ON CONFLICT (id) DO NOTHING
+				`, userIDStr, userEmail)  // ← PASTIKAN 2 ARGUMEN!
+
+				c.JSON(http.StatusOK, gin.H{"role": userType})
 				return
 			}
 
-			c.JSON(http.StatusOK, gin.H{"role": userType})
+			// ==========================================
+			// 3. Upsert sebagai teacher
+			// ==========================================
+			fmt.Println("[check-role] Bukan school_admin, upsert sebagai teacher")
+
+			_, err = database.DB.Exec(`
+				INSERT INTO profiles (id, email_sekolah, token_balance, is_active, updated_at)
+				VALUES ($1, $2, 0, TRUE, NOW())
+				ON CONFLICT (id) DO NOTHING
+			`, userIDStr, userEmail)  // ← PASTIKAN 2 ARGUMEN!
+
+			if err != nil {
+				fmt.Printf("[check-role] Gagal upsert profile: %v\n", err)
+			} else {
+				fmt.Println("[check-role] Upsert profile OK")
+			}
+
+			c.JSON(http.StatusOK, gin.H{"role": "teacher"})
 		})
 
 		api.POST("/auth/notify-password-changed", func(c *gin.Context) {
@@ -1447,9 +1505,27 @@ func SetupRoutes(r *gin.Engine) {
 		})
 
 		api.GET("/profile", func(c *gin.Context) {
-			userID, _ := c.Get("user_id")
+			fmt.Println("========================================")
+			fmt.Println(">>> [1] Handler /profile MULAI")
 
-			_, _ = database.DB.Exec(`UPDATE profiles SET last_login = NOW() WHERE id = $1`, userID)
+			userID, exists := c.Get("user_id")
+			if !exists {
+				fmt.Println(">>> [1b] ERROR: user_id tidak ada di context!")
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+			fmt.Printf(">>> [2] userID=%v (type=%T)\n", userID, userID)
+
+			// --- UPDATE last_login ---
+			fmt.Println(">>> [3] Akan UPDATE last_login...")
+			res, err := database.DB.Exec(`UPDATE profiles SET last_login = NOW() WHERE id = $1`, userID)
+			if err != nil {
+				fmt.Printf(">>> [3b] UPDATE last_login ERROR: %v\n", err)
+				// jangan return, lanjut saja — biar tahu error di step berikutnya
+			} else {
+				rowsAffected, _ := res.RowsAffected()
+				fmt.Printf(">>> [3c] UPDATE last_login OK, rows affected=%d\n", rowsAffected)
+			}
 
 			var p UpdateProfileRequest
 			var tokenBalance int
@@ -1464,7 +1540,24 @@ func SetupRoutes(r *gin.Engine) {
 				COALESCE(website_sekolah, ''), token_balance 
 				FROM profiles WHERE id = $1`
 
-			err := database.DB.QueryRow(queryFixed, userID).Scan(
+			// Hitung jumlah $N di query
+			dollarCount := strings.Count(queryFixed, "$")
+			fmt.Printf(">>> [4] Query SELECT siap. Jumlah placeholder $N = %d\n", dollarCount)
+			fmt.Printf(">>> [4b] Query full:\n%s\n", queryFixed)
+
+			// Hitung jumlah argumen yang dikirim
+			args := []any{userID}
+			fmt.Printf(">>> [5] Jumlah argumen yang dikirim = %d\n", len(args))
+			for i, a := range args {
+				fmt.Printf(">>> [5.%d] arg[%d] = %v (type=%T)\n", i, i, a, a)
+			}
+
+			if dollarCount != len(args) {
+				fmt.Printf(">>> [5b] ⚠️ MISMATCH! Query butuh %d param, tapi dikirim %d param\n", dollarCount, len(args))
+			}
+
+			fmt.Println(">>> [6] Akan eksekusi QueryRow...")
+			err = database.DB.QueryRow(queryFixed, args...).Scan(
 				&p.NamaGuru, &p.NipGuru, &p.NamaSekolah, &p.MataPelajaran, &p.Fase, &p.Kelas,
 				&p.Semester, &p.TahunPelajaran, &p.NamaKepalaSekolah, &p.NipKepalaSekolah,
 				&p.KotaKabupaten, &p.TanggalPenandatanganan, &p.AlamatSekolah, &p.KecamatanKabupaten,
@@ -1472,13 +1565,21 @@ func SetupRoutes(r *gin.Engine) {
 			)
 
 			if err != nil {
+				fmt.Printf(">>> [6b] QueryRow ERROR: %v\n", err)
+				fmt.Printf(">>> [6c] Error type: %T\n", err)
+
 				if err == sql.ErrNoRows {
+					fmt.Println(">>> [6d] Tidak ada row di profiles untuk userID ini")
 					c.JSON(http.StatusNotFound, gin.H{"error": "Profil tidak ditemukan"})
 					return
 				}
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
+
+			fmt.Printf(">>> [7] QueryRow SUKSES! token_balance=%d, nama_guru=%s\n", tokenBalance, p.NamaGuru)
+			fmt.Println(">>> [8] Handler /profile SELESAI")
+			fmt.Println("========================================")
 
 			c.JSON(http.StatusOK, gin.H{
 				"user_id":       userID,
