@@ -77,6 +77,43 @@ type CreateClassGroupRequest struct {
 	AcademicYearID string `json:"academic_year_id" binding:"required"`
 }
 
+type CreateSubClassRequest struct {
+	ClassGroupID      string `json:"class_group_id" binding:"required"`
+	Name              string `json:"name" binding:"required"`
+	Code              string `json:"code"`
+	Capacity          int    `json:"capacity"`
+	HomeroomTeacherID string `json:"homeroom_teacher_id"`
+	Notes             string `json:"notes"`
+}
+
+type UpdateSubClassRequest struct {
+	Name              string `json:"name"`
+	Code              string `json:"code"`
+	Capacity          int    `json:"capacity"`
+	HomeroomTeacherID string `json:"homeroom_teacher_id"`
+	Notes             string `json:"notes"`
+	IsActive          *bool  `json:"is_active"`
+}
+
+type CreateStudentRequest struct {
+	ClassSubGroupID string `json:"class_sub_group_id" binding:"required"`
+	FullName        string `json:"full_name" binding:"required"`
+	StudentNumber   string `json:"student_number"`
+	NISN            string `json:"nisn"`
+}
+
+type UpdateStudentRequest struct {
+	ClassSubGroupID string `json:"class_sub_group_id"`
+	FullName        string `json:"full_name"`
+	StudentNumber   string `json:"student_number"`
+	NISN            string `json:"nisn"`
+	IsActive        *bool  `json:"is_active"`
+}
+
+type MoveStudentRequest struct {
+	TargetSubGroupID string `json:"target_sub_group_id" binding:"required"`
+}
+
 // --- Struct Pembelian Token & Midtrans ---
 type CreateTransactionRequest struct {
 	PackageName string `json:"package_name" binding:"required"`
@@ -2432,7 +2469,7 @@ func SetupRoutes(r *gin.Engine) {
 			`, schoolID, req.AcademicYearID, req.Name, req.Level, req.ClassType).Scan(&classID)
 
 			if err != nil {
-				fmt.Printf("[CREATE CLASS] ❌ INSERT ERROR: %v\n", err)
+				// fmt.Printf("[CREATE CLASS] ❌ INSERT ERROR: %v\n", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan data kelas: " + err.Error()})
 				return
 			}
@@ -2475,6 +2512,775 @@ func SetupRoutes(r *gin.Engine) {
 			}
 
 			c.JSON(http.StatusOK, gin.H{"message": "Kelas berhasil dihapus"})
+		})
+
+		// GET: List sub kelas berdasarkan class_group_id
+		api.GET("/school-admin/classes/:classId/sub-classes", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE id = $1 AND is_active = TRUE
+			`, userID).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			classID := c.Param("classId")
+
+			// Validasi class_group milik sekolah ini
+			var classExists string
+			err = database.DB.QueryRow(`
+				SELECT id FROM class_groups WHERE id = $1 AND school_id = $2
+			`, classID, schoolID).Scan(&classExists)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Kelas tidak ditemukan"})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT 
+					csg.id, csg.name, COALESCE(csg.code, ''), 
+					COALESCE(csg.capacity, 0), COALESCE(csg.notes, ''),
+					csg.homeroom_teacher_id, 
+					COALESCE(p.nama_guru, '') AS homeroom_teacher_name,
+					csg.is_active, csg.created_at
+				FROM class_sub_groups csg
+				LEFT JOIN profiles p ON csg.homeroom_teacher_id = p.id
+				WHERE csg.class_group_id = $1 AND csg.school_id = $2
+				ORDER BY csg.created_at ASC
+			`, classID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil sub kelas: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type SubClassItem struct {
+				ID                  string    `json:"id"`
+				Name                string    `json:"name"`
+				Code                string    `json:"code"`
+				Capacity            int       `json:"capacity"`
+				Notes               string    `json:"notes"`
+				HomeroomTeacherID   *string   `json:"homeroom_teacher_id"`
+				HomeroomTeacherName string    `json:"homeroom_teacher_name"`
+				IsActive            bool      `json:"is_active"`
+				CreatedAt           time.Time `json:"created_at"`
+			}
+
+			var subs []SubClassItem
+			for rows.Next() {
+				var s SubClassItem
+				var teacherID sql.NullString
+				if err := rows.Scan(
+					&s.ID, &s.Name, &s.Code, &s.Capacity, &s.Notes,
+					&teacherID, &s.HomeroomTeacherName, &s.IsActive, &s.CreatedAt,
+				); err == nil {
+					if teacherID.Valid {
+						s.HomeroomTeacherID = &teacherID.String
+					}
+					subs = append(subs, s)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"class_group_id": classID,
+				"sub_classes":    subs,
+			})
+		})
+
+		// POST: Tambah sub kelas baru
+		api.POST("/school-admin/sub-classes", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			// Normalisasi userID
+			var userIDStr string
+			switch v := userID.(type) {
+			case string:
+				userIDStr = v
+			default:
+				userIDStr = fmt.Sprintf("%v", v)
+			}
+
+			// Ambil school_id (fallback via email)
+			var userEmail string
+			_ = database.DB.QueryRow(
+				`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`,
+				userIDStr,
+			).Scan(&userEmail)
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE (id = $1 OR (email <> '' AND email = $2)) 
+				AND is_active = TRUE
+				LIMIT 1
+			`, userIDStr, userEmail).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			var req CreateSubClassRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format data tidak valid: " + err.Error()})
+				return
+			}
+
+			// Validasi class_group milik sekolah ini
+			var classExists string
+			err = database.DB.QueryRow(`
+				SELECT id FROM class_groups WHERE id = $1 AND school_id = $2
+			`, req.ClassGroupID, schoolID).Scan(&classExists)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Kelas induk tidak ditemukan atau bukan milik sekolah Anda"})
+				return
+			}
+
+			// Cek duplikat nama
+			var existingID string
+			err = database.DB.QueryRow(`
+				SELECT id FROM class_sub_groups 
+				WHERE class_group_id = $1 AND name = $2
+			`, req.ClassGroupID, req.Name).Scan(&existingID)
+			if err == nil && existingID != "" {
+				c.JSON(http.StatusConflict, gin.H{"error": "Sub kelas dengan nama tersebut sudah ada"})
+				return
+			}
+
+			// Insert
+			var subID string
+			var homeroomTeacher interface{} = nil
+			if req.HomeroomTeacherID != "" {
+				homeroomTeacher = req.HomeroomTeacherID
+			}
+
+			err = database.DB.QueryRow(`
+				INSERT INTO class_sub_groups 
+					(class_group_id, school_id, name, code, capacity, homeroom_teacher_id, notes)
+				VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, NULLIF($7, ''))
+				RETURNING id
+			`, req.ClassGroupID, schoolID, req.Name, req.Code, req.Capacity, homeroomTeacher, req.Notes).Scan(&subID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan sub kelas: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message": "Sub kelas berhasil ditambahkan",
+				"id":      subID,
+			})
+		})
+
+		// PUT: Update sub kelas
+		api.PUT("/school-admin/sub-classes/:id", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE id = $1 AND is_active = TRUE
+			`, userID).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			subID := c.Param("id")
+
+			var req UpdateSubClassRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format data tidak valid: " + err.Error()})
+				return
+			}
+
+			var homeroomTeacher interface{} = nil
+			if req.HomeroomTeacherID != "" {
+				homeroomTeacher = req.HomeroomTeacherID
+			}
+
+			var isActive interface{} = nil
+			if req.IsActive != nil {
+				isActive = *req.IsActive
+			}
+
+			result, err := database.DB.Exec(`
+				UPDATE class_sub_groups SET
+					name = COALESCE(NULLIF($1, ''), name),
+					code = NULLIF($2, ''),
+					capacity = $3,
+					homeroom_teacher_id = $4,
+					notes = NULLIF($5, ''),
+					is_active = COALESCE($6, is_active),
+					updated_at = NOW()
+				WHERE id = $7 AND school_id = $8
+			`, req.Name, req.Code, req.Capacity, homeroomTeacher, req.Notes, isActive, subID, schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memperbarui sub kelas: " + err.Error()})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sub kelas tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Sub kelas berhasil diperbarui"})
+		})
+
+		// DELETE: Hapus sub kelas
+		api.DELETE("/school-admin/sub-classes/:id", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE id = $1 AND is_active = TRUE
+			`, userID).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			subID := c.Param("id")
+
+			result, err := database.DB.Exec(`
+				DELETE FROM class_sub_groups WHERE id = $1 AND school_id = $2
+			`, subID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus sub kelas: " + err.Error()})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sub kelas tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Sub kelas berhasil dihapus"})
+		})
+
+		// GET: List semua sub kelas milik sekolah
+		api.GET("/school-admin/sub-classes", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			// Normalisasi userID
+			var userIDStr string
+			switch v := userID.(type) {
+			case string:
+				userIDStr = v
+			default:
+				userIDStr = fmt.Sprintf("%v", v)
+			}
+
+			// Ambil email sebagai fallback
+			var userEmail string
+			_ = database.DB.QueryRow(
+				`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`,
+				userIDStr,
+			).Scan(&userEmail)
+
+			// Ambil school_id
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE (id = $1 OR (email <> '' AND email = $2)) 
+				AND is_active = TRUE
+				LIMIT 1
+			`, userIDStr, userEmail).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			// Query semua sub kelas dengan info master kelasnya
+			rows, err := database.DB.Query(`
+				SELECT 
+					csg.id,
+					csg.name,
+					COALESCE(csg.code, ''),
+					COALESCE(csg.capacity, 0),
+					COALESCE(csg.notes, ''),
+					csg.homeroom_teacher_id,
+					COALESCE(p.nama_guru, '') AS homeroom_teacher_name,
+					csg.is_active,
+					csg.created_at,
+					cg.id AS class_group_id,
+					cg.name AS class_group_name,
+					cg.level AS class_group_level,
+					COALESCE(cg.class_type, 'Umum') AS class_group_type,
+					cg.academic_year_id,
+					COALESCE(say.name, '-') AS academic_year_name,
+					COALESCE(say.semester, '-') AS semester
+				FROM class_sub_groups csg
+				JOIN class_groups cg ON csg.class_group_id = cg.id
+				LEFT JOIN school_academic_years say ON cg.academic_year_id = say.id
+				LEFT JOIN profiles p ON csg.homeroom_teacher_id = p.id
+				WHERE csg.school_id = $1
+				ORDER BY cg.level ASC, cg.name ASC, csg.name ASC
+			`, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil daftar sub kelas: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type SubClassWithClass struct {
+				ID                  string    `json:"id"`
+				Name                string    `json:"name"`
+				Code                string    `json:"code"`
+				Capacity            int       `json:"capacity"`
+				Notes               string    `json:"notes"`
+				HomeroomTeacherID   *string   `json:"homeroom_teacher_id"`
+				HomeroomTeacherName string    `json:"homeroom_teacher_name"`
+				IsActive            bool      `json:"is_active"`
+				CreatedAt           time.Time `json:"created_at"`
+				ClassGroupID        string    `json:"class_group_id"`
+				ClassGroupName      string    `json:"class_group_name"`
+				ClassGroupLevel     string    `json:"class_group_level"`
+				ClassGroupType      string    `json:"class_group_type"`
+				AcademicYearID      string    `json:"academic_year_id"`
+				AcademicYearName    string    `json:"academic_year_name"`
+				Semester            string    `json:"semester"`
+			}
+
+			var subClasses []SubClassWithClass
+			for rows.Next() {
+				var s SubClassWithClass
+				var teacherID sql.NullString
+				if err := rows.Scan(
+					&s.ID, &s.Name, &s.Code, &s.Capacity, &s.Notes,
+					&teacherID, &s.HomeroomTeacherName, &s.IsActive, &s.CreatedAt,
+					&s.ClassGroupID, &s.ClassGroupName, &s.ClassGroupLevel, &s.ClassGroupType,
+					&s.AcademicYearID, &s.AcademicYearName, &s.Semester,
+				); err == nil {
+					if teacherID.Valid {
+						s.HomeroomTeacherID = &teacherID.String
+					}
+					subClasses = append(subClasses, s)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"total":       len(subClasses),
+				"sub_classes": subClasses,
+			})
+		})
+
+		// GET: List semua murid (dengan filter opsional by sub class)
+		api.GET("/school-admin/students", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			// Normalisasi userID
+			var userIDStr string
+			switch v := userID.(type) {
+			case string:
+				userIDStr = v
+			default:
+				userIDStr = fmt.Sprintf("%v", v)
+			}
+
+			var userEmail string
+			_ = database.DB.QueryRow(
+				`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`,
+				userIDStr,
+			).Scan(&userEmail)
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE (id = $1 OR (email <> '' AND email = $2)) 
+				AND is_active = TRUE
+				LIMIT 1
+			`, userIDStr, userEmail).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			// Filter opsional: ?sub_class_id=xxx
+			subClassID := c.Query("sub_class_id")
+
+			query := `
+				SELECT 
+					s.id, s.full_name, COALESCE(s.student_number, ''), 
+					COALESCE(s.nisn, ''), s.is_active, s.created_at,
+					s.class_sub_group_id,
+					COALESCE(csg.name, '') AS sub_class_name,
+					csg.class_group_id,
+					COALESCE(cg.name, '') AS class_group_name,
+					COALESCE(cg.class_type, 'Umum') AS class_group_type
+				FROM students s
+				LEFT JOIN class_sub_groups csg ON s.class_sub_group_id = csg.id
+				LEFT JOIN class_groups cg ON csg.class_group_id = cg.id
+				WHERE s.school_id = $1
+			`
+			args := []any{schoolID}
+
+			if subClassID != "" {
+				query += ` AND s.class_sub_group_id = $2`
+				args = append(args, subClassID)
+			}
+
+			query += ` ORDER BY cg.level ASC, csg.name ASC, s.full_name ASC`
+
+			rows, err := database.DB.Query(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data murid: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type StudentItem struct {
+				ID               string    `json:"id"`
+				FullName         string    `json:"full_name"`
+				StudentNumber    string    `json:"student_number"`
+				NISN             string    `json:"nisn"`
+				IsActive         bool      `json:"is_active"`
+				CreatedAt        time.Time `json:"created_at"`
+				ClassSubGroupID  *string   `json:"class_sub_group_id"`
+				SubClassName     string    `json:"sub_class_name"`
+				ClassGroupID     *string   `json:"class_group_id"`
+				ClassGroupName   string    `json:"class_group_name"`
+				ClassGroupType   string    `json:"class_group_type"`
+			}
+
+			var students []StudentItem
+			for rows.Next() {
+				var s StudentItem
+				var subGroupID, classGroupID sql.NullString
+				if err := rows.Scan(
+					&s.ID, &s.FullName, &s.StudentNumber, &s.NISN, &s.IsActive, &s.CreatedAt,
+					&subGroupID, &s.SubClassName, &classGroupID, &s.ClassGroupName, &s.ClassGroupType,
+				); err == nil {
+					if subGroupID.Valid {
+						s.ClassSubGroupID = &subGroupID.String
+					}
+					if classGroupID.Valid {
+						s.ClassGroupID = &classGroupID.String
+					}
+					students = append(students, s)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"total":    len(students),
+				"students": students,
+			})
+		})
+
+		// POST: Tambah murid baru & distribusikan ke sub kelas
+		api.POST("/school-admin/students", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var userIDStr string
+			switch v := userID.(type) {
+			case string:
+				userIDStr = v
+			default:
+				userIDStr = fmt.Sprintf("%v", v)
+			}
+
+			var userEmail string
+			_ = database.DB.QueryRow(
+				`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`,
+				userIDStr,
+			).Scan(&userEmail)
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE (id = $1 OR (email <> '' AND email = $2)) 
+				AND is_active = TRUE
+				LIMIT 1
+			`, userIDStr, userEmail).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			var req CreateStudentRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format data tidak valid: " + err.Error()})
+				return
+			}
+
+			// Validasi sub class milik sekolah ini
+			var classGroupID string
+			err = database.DB.QueryRow(`
+				SELECT class_group_id FROM class_sub_groups 
+				WHERE id = $1 AND school_id = $2
+			`, req.ClassSubGroupID, schoolID).Scan(&classGroupID)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Sub kelas tidak ditemukan atau bukan milik sekolah Anda"})
+				return
+			}
+
+			// Cek duplikat NISN (jika diisi)
+			if req.NISN != "" {
+				var existingID string
+				err = database.DB.QueryRow(`
+					SELECT id FROM students WHERE school_id = $1 AND nisn = $2
+				`, schoolID, req.NISN).Scan(&existingID)
+				if err == nil && existingID != "" {
+					c.JSON(http.StatusConflict, gin.H{"error": "NISN sudah terdaftar di sekolah ini"})
+					return
+				}
+			}
+
+			// Insert
+			var studentID string
+			err = database.DB.QueryRow(`
+				INSERT INTO students 
+					(school_id, class_group_id, class_sub_group_id, full_name, student_number, nisn, is_active)
+				VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), TRUE)
+				RETURNING id
+			`, schoolID, classGroupID, req.ClassSubGroupID, req.FullName, req.StudentNumber, req.NISN).Scan(&studentID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan data murid: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message": "Murid berhasil ditambahkan",
+				"id":      studentID,
+			})
+		})
+
+		// PUT: Update data murid (termasuk pindah sub kelas)
+		api.PUT("/school-admin/students/:id", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var userIDStr string
+			switch v := userID.(type) {
+			case string:
+				userIDStr = v
+			default:
+				userIDStr = fmt.Sprintf("%v", v)
+			}
+
+			var userEmail string
+			_ = database.DB.QueryRow(
+				`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`,
+				userIDStr,
+			).Scan(&userEmail)
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE (id = $1 OR (email <> '' AND email = $2)) 
+				AND is_active = TRUE
+				LIMIT 1
+			`, userIDStr, userEmail).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			studentID := c.Param("id")
+
+			var req UpdateStudentRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format data tidak valid: " + err.Error()})
+				return
+			}
+
+			// Jika pindah sub kelas, validasi dulu
+			var newClassGroupID interface{} = nil
+			if req.ClassSubGroupID != "" {
+				var cgID string
+				err = database.DB.QueryRow(`
+					SELECT class_group_id FROM class_sub_groups 
+					WHERE id = $1 AND school_id = $2
+				`, req.ClassSubGroupID, schoolID).Scan(&cgID)
+				if err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Sub kelas tujuan tidak valid"})
+					return
+				}
+				newClassGroupID = cgID
+			}
+
+			var isActive interface{} = nil
+			if req.IsActive != nil {
+				isActive = *req.IsActive
+			}
+
+			var subGroupID interface{} = nil
+			if req.ClassSubGroupID != "" {
+				subGroupID = req.ClassSubGroupID
+			}
+
+			result, err := database.DB.Exec(`
+				UPDATE students SET
+					full_name = COALESCE(NULLIF($1, ''), full_name),
+					student_number = NULLIF($2, ''),
+					nisn = NULLIF($3, ''),
+					class_sub_group_id = $4,
+					class_group_id = COALESCE($5, class_group_id),
+					is_active = COALESCE($6, is_active),
+					updated_at = NOW()
+				WHERE id = $7 AND school_id = $8
+			`, req.FullName, req.StudentNumber, req.NISN, subGroupID, newClassGroupID, isActive, studentID, schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memperbarui data murid: " + err.Error()})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Murid tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Data murid berhasil diperbarui"})
+		})
+
+		// DELETE: Hapus murid
+		api.DELETE("/school-admin/students/:id", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE id = $1 AND is_active = TRUE
+			`, userID).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			studentID := c.Param("id")
+
+			result, err := database.DB.Exec(`
+				DELETE FROM students WHERE id = $1 AND school_id = $2
+			`, studentID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus murid: " + err.Error()})
+				return
+			}
+
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Murid tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Murid berhasil dihapus"})
+		})
+
+		// GET: Statistik distribusi per sub kelas
+		api.GET("/school-admin/students/stats", func(c *gin.Context) {
+			userID, exists := c.Get("user_id")
+			if !exists {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				return
+			}
+
+			var userIDStr string
+			switch v := userID.(type) {
+			case string:
+				userIDStr = v
+			default:
+				userIDStr = fmt.Sprintf("%v", v)
+			}
+
+			var userEmail string
+			_ = database.DB.QueryRow(
+				`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`,
+				userIDStr,
+			).Scan(&userEmail)
+
+			var schoolID string
+			err := database.DB.QueryRow(`
+				SELECT school_id FROM school_admins 
+				WHERE (id = $1 OR (email <> '' AND email = $2)) 
+				AND is_active = TRUE
+				LIMIT 1
+			`, userIDStr, userEmail).Scan(&schoolID)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak"})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT 
+					csg.id, csg.name, COALESCE(csg.capacity, 0),
+					cg.name AS class_group_name,
+					COUNT(s.id) AS student_count
+				FROM class_sub_groups csg
+				JOIN class_groups cg ON csg.class_group_id = cg.id
+				LEFT JOIN students s ON s.class_sub_group_id = csg.id AND s.is_active = TRUE
+				WHERE csg.school_id = $1
+				GROUP BY csg.id, csg.name, csg.capacity, cg.name
+				ORDER BY cg.name ASC, csg.name ASC
+			`, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil statistik: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type StatItem struct {
+				ID             string `json:"id"`
+				Name           string `json:"name"`
+				Capacity       int    `json:"capacity"`
+				ClassGroupName string `json:"class_group_name"`
+				StudentCount   int    `json:"student_count"`
+			}
+
+			var stats []StatItem
+			for rows.Next() {
+				var s StatItem
+				if err := rows.Scan(&s.ID, &s.Name, &s.Capacity, &s.ClassGroupName, &s.StudentCount); err == nil {
+					stats = append(stats, s)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"stats": stats})
 		})
 	}
 }
