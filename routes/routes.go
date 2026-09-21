@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/generative-ai-go/genai"
+	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/api/option"
 )
@@ -114,6 +115,134 @@ type MoveStudentRequest struct {
 	TargetSubGroupID string `json:"target_sub_group_id" binding:"required"`
 }
 
+// ==========================================
+// ATTENDANCE SYSTEM STRUCTS
+// ==========================================
+
+// --- Academic Calendar ---
+type CreateCalendarEventRequest struct {
+	CalendarDate       string   `json:"calendar_date" binding:"required"` // YYYY-MM-DD
+	DayType            string   `json:"day_type" binding:"required"`      // school_day | holiday | weekend | exam | event | emergency
+	Name               string   `json:"name" binding:"required"`
+	Description        string   `json:"description"`
+	IsAttendanceRequired *bool  `json:"is_attendance_required"`
+	IncludeInReport    *bool    `json:"include_in_report"`
+	TargetClassGroupIDs []string `json:"target_class_group_ids"`
+}
+
+type UpdateCalendarEventRequest struct {
+	Name                 string   `json:"name"`
+	Description          string   `json:"description"`
+	IsAttendanceRequired *bool    `json:"is_attendance_required"`
+	IncludeInReport      *bool    `json:"include_in_report"`
+	TargetClassGroupIDs  []string `json:"target_class_group_ids"`
+}
+
+// --- Attendance Shifts ---
+type CreateShiftRequest struct {
+	Name        string `json:"name" binding:"required"`
+	Code        string `json:"code" binding:"required"`
+	Description string `json:"description"`
+
+	ShiftCategory string `json:"shift_category"` // regular | exam | event | extracurricular
+
+	CheckInStart       string `json:"check_in_start" binding:"required"`
+	CheckInOnTimeStart string `json:"check_in_on_time_start" binding:"required"`
+	CheckInOnTimeEnd   string `json:"check_in_on_time_end" binding:"required"`
+	CheckInEnd         string `json:"check_in_end" binding:"required"`
+
+	RequireCheckOut      bool   `json:"require_check_out"`
+	CheckOutStart        string `json:"check_out_start"`
+	CheckOutOnTimeStart  string `json:"check_out_on_time_start"`
+	CheckOutOnTimeEnd    string `json:"check_out_on_time_end"`
+	CheckOutEnd          string `json:"check_out_end"`
+
+	AllowEarlyCheckIn  *bool `json:"allow_early_check_in"`
+	AllowLateCheckOut  *bool `json:"allow_late_check_out"`
+
+	AutoCloseMinutesAfterCheckIn  *int `json:"auto_close_minutes_after_check_in"`
+	AutoCloseMinutesAfterCheckOut *int `json:"auto_close_minutes_after_check_out"`
+
+	EarlyThresholdMinutes      *int `json:"early_threshold_minutes"`
+	LateToleranceMinutes       *int `json:"late_tolerance_minutes"`
+	EarlyLeaveToleranceMinutes *int `json:"early_leave_tolerance_minutes"`
+
+	ApplicableDays []int `json:"applicable_days"`
+
+	IsActive  *bool `json:"is_active"`
+	IsDefault *bool `json:"is_default"`
+}
+
+type UpdateShiftRequest struct {
+	Name        string `json:"name"`
+	Code        string `json:"code"`
+	Description string `json:"description"`
+	// Semua field opsional untuk partial update
+	CheckInStart       string `json:"check_in_start"`
+	CheckInOnTimeStart string `json:"check_in_on_time_start"`
+	CheckInOnTimeEnd   string `json:"check_in_on_time_end"`
+	CheckInEnd         string `json:"check_in_end"`
+
+	RequireCheckOut     *bool  `json:"require_check_out"`
+	CheckOutStart       string `json:"check_out_start"`
+	CheckOutOnTimeStart string `json:"check_out_on_time_start"`
+	CheckOutOnTimeEnd   string `json:"check_out_on_time_end"`
+	CheckOutEnd         string `json:"check_out_end"`
+
+	IsActive *bool `json:"is_active"`
+}
+
+// --- Class Shift Assignments ---
+type CreateClassShiftAssignmentRequest struct {
+	ClassGroupID    string `json:"class_group_id"`
+	ClassSubGroupID string `json:"class_sub_group_id"`
+	ShiftID         string `json:"shift_id" binding:"required"`
+
+	Priority  int   `json:"priority"`
+	IsPrimary *bool `json:"is_primary"`
+
+	OverrideCheckInStart  string `json:"override_check_in_start"`
+	OverrideCheckInEnd    string `json:"override_check_in_end"`
+	OverrideCheckOutStart string `json:"override_check_out_start"`
+	OverrideCheckOutEnd   string `json:"override_check_out_end"`
+
+	EffectiveFrom string `json:"effective_from"`
+	EffectiveTo   string `json:"effective_to"`
+}
+
+// --- Attendance Sessions ---
+type CreateAttendanceSessionRequest struct {
+	ShiftID string `json:"shift_id" binding:"required"`
+
+	ClassGroupID    string `json:"class_group_id"`
+	ClassSubGroupID string `json:"class_sub_group_id"`
+
+	Title       string `json:"title"`
+	SessionDate string `json:"session_date"` // YYYY-MM-DD, default today
+	Notes       string `json:"notes"`
+}
+
+type CloseAttendanceSessionRequest struct {
+	Notes string `json:"notes"`
+}
+
+// --- Scan ---
+type ScanQRRequest struct {
+	SessionID     string `json:"session_id" binding:"required"`
+	QRToken       string `json:"qr_token" binding:"required"`
+	ForceMode     string `json:"force_mode"` // check_in | check_out (opsional, untuk override)
+}
+
+// --- Student QR ---
+type GenerateQRRequest struct {
+	StudentIDs []string `json:"student_ids"` // jika kosong, generate untuk semua siswa sekolah
+	ClassSubGroupID string `json:"class_sub_group_id"` // filter by sub class (opsional)
+}
+
+type RegenerateQRRequest struct {
+	Reason string `json:"reason"`
+}
+
 // --- Struct Pembelian Token & Midtrans ---
 type CreateTransactionRequest struct {
 	PackageName string `json:"package_name" binding:"required"`
@@ -194,6 +323,21 @@ type SubmitExamRequest struct {
 	StudentNumber string            `json:"student_number" binding:"required"`
 	NISN          string            `json:"nisn" binding:"required"`
 	Answers       map[string]string `json:"answers" binding:"required"`
+}
+
+func joinStrings(strs []string, sep string) string {
+	if len(strs) == 0 {
+		return ""
+	}
+	result := strs[0]
+	for i := 1; i < len(strs); i++ {
+		result += sep + strs[i]
+	}
+	return result
+}
+
+func strPtr(s string) *string {
+	return &s
 }
 
 func logSuperAdminActivity(adminID int, action, ipAddress, userAgent, location, details string) {
@@ -321,6 +465,138 @@ func randString(n int) string {
 		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
 	}
 	return string(b)
+}
+
+func getSchoolIDFromUser(c *gin.Context) (string, error) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		return "", fmt.Errorf("unauthorized")
+	}
+
+	var userIDStr string
+	switch v := userID.(type) {
+	case string:
+		userIDStr = v
+	case fmt.Stringer:
+		userIDStr = v.String()
+	default:
+		userIDStr = fmt.Sprintf("%v", v)
+	}
+
+	var userEmail string
+	_ = database.DB.QueryRow(
+		`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`,
+		userIDStr,
+	).Scan(&userEmail)
+
+	var schoolID string
+	err := database.DB.QueryRow(`
+		SELECT school_id FROM school_admins 
+		WHERE (id = $1 OR (email <> '' AND email = $2)) 
+		AND is_active = TRUE
+		LIMIT 1
+	`, userIDStr, userEmail).Scan(&schoolID)
+
+	if err != nil {
+		return "", fmt.Errorf("akses ditolak: admin sekolah tidak valid")
+	}
+
+	return schoolID, nil
+}
+
+// getAdminIDFromUser — helper untuk ambil admin UUID (untuk opened_by, closed_by, dll)
+func getAdminIDFromUser(c *gin.Context) (string, error) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		return "", fmt.Errorf("unauthorized")
+	}
+
+	var userIDStr string
+	switch v := userID.(type) {
+	case string:
+		userIDStr = v
+	default:
+		userIDStr = fmt.Sprintf("%v", v)
+	}
+
+	return userIDStr, nil
+}
+
+// generateQRToken — generate token STU-xxxxxxxxxxxxxxxx
+func generateQRToken() string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 16)
+	for i := range b {
+		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+		time.Sleep(1 * time.Nanosecond) // ensure different seed
+	}
+	return "STU-" + string(b)
+}
+
+// parseTimeString — parse "HH:MM" atau "HH:MM:SS" → time.Time
+func parseTimeString(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty time string")
+	}
+	// Coba HH:MM:SS dulu
+	t, err := time.Parse("15:04:05", s)
+	if err == nil {
+		return t, nil
+	}
+	// Fallback HH:MM
+	return time.Parse("15:04", s)
+}
+
+// timeToMinutes — konversi time ke menit dari tengah malam
+func timeToMinutes(t time.Time) int {
+	return t.Hour()*60 + t.Minute()
+}
+
+// determineCheckInStatus — tentukan status check-in
+func determineCheckInStatus(checkInStart, checkInEnd, scanTime time.Time) string {
+	startMin := timeToMinutes(checkInStart)
+	endMin := timeToMinutes(checkInEnd)
+	scanMin := timeToMinutes(scanTime)
+
+	if scanMin < startMin {
+		return "early"
+	}
+	if scanMin > endMin {
+		return "late"
+	}
+	// Di tengah: on_time atau early (tergantung konfigurasi)
+	// Untuk simple: pakai 1/3 dan 2/3 sebagai threshold
+	rangeMin := endMin - startMin
+	if rangeMin > 0 {
+		firstThird := startMin + rangeMin/3
+		if scanMin < firstThird {
+			return "early"
+		}
+	}
+	return "on_time"
+}
+
+// determineCheckOutStatus — tentukan status check-out
+func determineCheckOutStatus(checkOutStart, checkOutEnd, scanTime time.Time) string {
+	startMin := timeToMinutes(checkOutStart)
+	endMin := timeToMinutes(checkOutEnd)
+	scanMin := timeToMinutes(scanTime)
+
+	if scanMin < startMin {
+		return "early_leave"
+	}
+	if scanMin > endMin {
+		return "late_leave"
+	}
+	// Di tengah: on_time_leave atau early_leave
+	rangeMin := endMin - startMin
+	if rangeMin > 0 {
+		firstThird := startMin + rangeMin/3
+		if scanMin < firstThird {
+			return "early_leave"
+		}
+	}
+	return "on_time_leave"
 }
 
 func SetupRoutes(r *gin.Engine) {
@@ -3282,5 +3558,1789 @@ func SetupRoutes(r *gin.Engine) {
 
 			c.JSON(http.StatusOK, gin.H{"stats": stats})
 		})
+
+		api.GET("/school-admin/calendar", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			// Filter opsional
+			fromDate := c.Query("from")     // YYYY-MM-DD
+			toDate := c.Query("to")         // YYYY-MM-DD
+			dayType := c.Query("type")      // school_day | holiday | dll
+
+			query := `
+				SELECT id, calendar_date, day_type, name, COALESCE(description, ''),
+					is_attendance_required, include_in_report,
+					COALESCE(target_class_group_ids, ARRAY[]::uuid[]),
+					created_at
+				FROM academic_calendar
+				WHERE school_id = $1
+			`
+			args := []any{schoolID}
+			argIdx := 2
+
+			if fromDate != "" {
+				query += fmt.Sprintf(" AND calendar_date >= $%d", argIdx)
+				args = append(args, fromDate)
+				argIdx++
+			}
+			if toDate != "" {
+				query += fmt.Sprintf(" AND calendar_date <= $%d", argIdx)
+				args = append(args, toDate)
+				argIdx++
+			}
+			if dayType != "" {
+				query += fmt.Sprintf(" AND day_type = $%d", argIdx)
+				args = append(args, dayType)
+				argIdx++
+			}
+
+			query += " ORDER BY calendar_date ASC"
+
+			rows, err := database.DB.Query(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil kalender: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type CalendarItem struct {
+				ID                   string    `json:"id"`
+				CalendarDate         string    `json:"calendar_date"`
+				DayType              string    `json:"day_type"`
+				Name                 string    `json:"name"`
+				Description          string    `json:"description"`
+				IsAttendanceRequired bool      `json:"is_attendance_required"`
+				IncludeInReport      bool      `json:"include_in_report"`
+				TargetClassGroupIDs  []string  `json:"target_class_group_ids"`
+				CreatedAt            time.Time `json:"created_at"`
+			}
+
+			var list []CalendarItem
+			for rows.Next() {
+				var item CalendarItem
+				var dateVal time.Time
+				var targetIDs []string
+
+				if err := rows.Scan(
+					&item.ID, &dateVal, &item.DayType, &item.Name, &item.Description,
+					&item.IsAttendanceRequired, &item.IncludeInReport, &targetIDs, &item.CreatedAt,
+				); err == nil {
+					item.CalendarDate = dateVal.Format("2006-01-02")
+					item.TargetClassGroupIDs = targetIDs
+					list = append(list, item)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"calendar": list, "total": len(list)})
+		})
+
+		api.POST("/school-admin/calendar", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			var req CreateCalendarEventRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			isAttendanceRequired := true
+			if req.IsAttendanceRequired != nil {
+				isAttendanceRequired = *req.IsAttendanceRequired
+			}
+			includeInReport := true
+			if req.IncludeInReport != nil {
+				includeInReport = *req.IncludeInReport
+			}
+
+			var targetIDs interface{} = nil
+			if len(req.TargetClassGroupIDs) > 0 {
+				targetIDs = req.TargetClassGroupIDs
+			}
+
+			var newID string
+			err = database.DB.QueryRow(`
+				INSERT INTO academic_calendar (
+					school_id, calendar_date, day_type, name, description,
+					is_attendance_required, include_in_report,
+					target_class_group_ids, created_by
+				) VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9)
+				RETURNING id
+			`, schoolID, req.CalendarDate, req.DayType, req.Name, req.Description,
+				isAttendanceRequired, includeInReport, targetIDs, adminID).Scan(&newID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{"message": "Event kalender berhasil dibuat", "id": newID})
+		})
+
+		// PUT: Update kalender event
+		api.PUT("/school-admin/calendar/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			eventID := c.Param("id")
+			var req UpdateCalendarEventRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid"})
+				return
+			}
+
+			var targetIDs interface{} = nil
+			if len(req.TargetClassGroupIDs) > 0 {
+				targetIDs = req.TargetClassGroupIDs
+			}
+
+			result, err := database.DB.Exec(`
+				UPDATE academic_calendar SET
+					name = COALESCE(NULLIF($1, ''), name),
+					description = COALESCE(NULLIF($2, ''), description),
+					is_attendance_required = COALESCE($3, is_attendance_required),
+					include_in_report = COALESCE($4, include_in_report),
+					target_class_group_ids = COALESCE($5, target_class_group_ids),
+					updated_at = NOW()
+				WHERE id = $6 AND school_id = $7
+			`, req.Name, req.Description, req.IsAttendanceRequired, req.IncludeInReport,
+				targetIDs, eventID, schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Event tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Event berhasil diperbarui"})
+		})
+
+		// DELETE: Hapus kalender event
+		api.DELETE("/school-admin/calendar/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			result, err := database.DB.Exec(
+				`DELETE FROM academic_calendar WHERE id = $1 AND school_id = $2`,
+				c.Param("id"), schoolID,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Event tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Event berhasil dihapus"})
+		})
+
+		// ==========================================
+		// ATTENDANCE SHIFTS
+		// ==========================================
+
+		// GET: List shifts
+		api.GET("/school-admin/attendance/shifts", func(c *gin.Context) {
+			fmt.Println("════════════════════════════════════════")
+			fmt.Println("[GET SHIFTS] ▶ START")
+
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				fmt.Printf("[GET SHIFTS] ❌ getSchoolIDFromUser error: %v\n", err)
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			fmt.Printf("[GET SHIFTS] ✅ schoolID = %q\n", schoolID)
+
+			rows, err := database.DB.Query(`
+				SELECT id, name, code, COALESCE(description, ''), shift_category,
+					check_in_start, check_in_on_time_start, check_in_on_time_end, check_in_end,
+					require_check_out, check_out_start, check_out_on_time_start, 
+					check_out_on_time_end, check_out_end,
+					allow_early_check_in, allow_late_check_out,
+					auto_close_minutes_after_check_in, auto_close_minutes_after_check_out,
+					early_threshold_minutes, late_tolerance_minutes, early_leave_tolerance_minutes,
+					COALESCE(applicable_days, ARRAY[1,2,3,4,5,6]),
+					is_active, is_default, created_at
+				FROM attendance_shifts
+				WHERE school_id = $1
+				ORDER BY is_default DESC, code ASC
+			`, schoolID)
+			if err != nil {
+				fmt.Printf("[GET SHIFTS] ❌ Query error: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat shift: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type ShiftItem struct {
+				ID                            string   `json:"id"`
+				Name                          string   `json:"name"`
+				Code                          string   `json:"code"`
+				Description                   string   `json:"description"`
+				ShiftCategory                 string   `json:"shift_category"`
+				CheckInStart                  string   `json:"check_in_start"`
+				CheckInOnTimeStart            string   `json:"check_in_on_time_start"`
+				CheckInOnTimeEnd              string   `json:"check_in_on_time_end"`
+				CheckInEnd                    string   `json:"check_in_end"`
+				RequireCheckOut               bool     `json:"require_check_out"`
+				CheckOutStart                 *string  `json:"check_out_start"`
+				CheckOutOnTimeStart           *string  `json:"check_out_on_time_start"`
+				CheckOutOnTimeEnd             *string  `json:"check_out_on_time_end"`
+				CheckOutEnd                   *string  `json:"check_out_end"`
+				AllowEarlyCheckIn             bool     `json:"allow_early_check_in"`
+				AllowLateCheckOut             bool     `json:"allow_late_check_out"`
+				AutoCloseMinutesAfterCheckIn  int      `json:"auto_close_minutes_after_check_in"`
+				AutoCloseMinutesAfterCheckOut int      `json:"auto_close_minutes_after_check_out"`
+				EarlyThresholdMinutes         int      `json:"early_threshold_minutes"`
+				LateToleranceMinutes          int      `json:"late_tolerance_minutes"`
+				EarlyLeaveToleranceMinutes    int      `json:"early_leave_tolerance_minutes"`
+				ApplicableDays                []int    `json:"applicable_days"`
+				IsActive                      bool     `json:"is_active"`
+				IsDefault                     bool     `json:"is_default"`
+				CreatedAt                     time.Time `json:"created_at"`
+			}
+
+			list := []ShiftItem{}
+			for rows.Next() {
+				var s ShiftItem
+				var ciStart, ciOnTimeStart, ciOnTimeEnd, ciEnd time.Time
+				var coStart, coOnTimeStart, coOnTimeEnd, coEnd sql.NullString
+				var applicableDays pq.Int64Array  // ← PAKAI INI
+
+				if err := rows.Scan(
+					&s.ID, &s.Name, &s.Code, &s.Description, &s.ShiftCategory,
+					&ciStart, &ciOnTimeStart, &ciOnTimeEnd, &ciEnd,
+					&s.RequireCheckOut, &coStart, &coOnTimeStart, &coOnTimeEnd, &coEnd,
+					&s.AllowEarlyCheckIn, &s.AllowLateCheckOut,
+					&s.AutoCloseMinutesAfterCheckIn, &s.AutoCloseMinutesAfterCheckOut,
+					&s.EarlyThresholdMinutes, &s.LateToleranceMinutes, &s.EarlyLeaveToleranceMinutes,
+					&applicableDays,  // ← SCAN ke pq.Int64Array
+					&s.IsActive, &s.IsDefault, &s.CreatedAt,
+				); err != nil {
+					fmt.Printf("[GET SHIFTS] ⚠️ Scan error: %v\n", err)
+					continue
+				}
+
+				// Convert pq.Int64Array → []int
+				s.ApplicableDays = make([]int, len(applicableDays))
+				for i, v := range applicableDays {
+					s.ApplicableDays[i] = int(v)
+				}
+
+				s.CheckInStart = ciStart.Format("15:04")
+				s.CheckInOnTimeStart = ciOnTimeStart.Format("15:04")
+				s.CheckInOnTimeEnd = ciOnTimeEnd.Format("15:04")
+				s.CheckInEnd = ciEnd.Format("15:04")
+
+				if coStart.Valid { t, _ := time.Parse("15:04:05", coStart.String); s.CheckOutStart = strPtr(t.Format("15:04")) }
+				if coOnTimeStart.Valid { t, _ := time.Parse("15:04:05", coOnTimeStart.String); s.CheckOutOnTimeStart = strPtr(t.Format("15:04")) }
+				if coOnTimeEnd.Valid { t, _ := time.Parse("15:04:05", coOnTimeEnd.String); s.CheckOutOnTimeEnd = strPtr(t.Format("15:04")) }
+				if coEnd.Valid { t, _ := time.Parse("15:04:05", coEnd.String); s.CheckOutEnd = strPtr(t.Format("15:04")) }
+
+				list = append(list, s)
+			}
+
+			fmt.Printf("[GET SHIFTS] ✅ Total shifts returned: %d\n", len(list))
+			c.JSON(http.StatusOK, gin.H{"shifts": list, "total": len(list)})
+		})
+
+		// POST: Create shift
+		api.POST("/school-admin/attendance/shifts", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			var req CreateShiftRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// Defaults
+			allowEarly := true
+			if req.AllowEarlyCheckIn != nil { allowEarly = *req.AllowEarlyCheckIn }
+			allowLateOut := false
+			if req.AllowLateCheckOut != nil { allowLateOut = *req.AllowLateCheckOut }
+			autoCloseIn := 120
+			if req.AutoCloseMinutesAfterCheckIn != nil { autoCloseIn = *req.AutoCloseMinutesAfterCheckIn }
+			autoCloseOut := 60
+			if req.AutoCloseMinutesAfterCheckOut != nil { autoCloseOut = *req.AutoCloseMinutesAfterCheckOut }
+			earlyThreshold := 15
+			if req.EarlyThresholdMinutes != nil { earlyThreshold = *req.EarlyThresholdMinutes }
+			lateTolerance := 5
+			if req.LateToleranceMinutes != nil { lateTolerance = *req.LateToleranceMinutes }
+			earlyLeaveTolerance := 15
+			if req.EarlyLeaveToleranceMinutes != nil { earlyLeaveTolerance = *req.EarlyLeaveToleranceMinutes }
+			isActive := true
+			if req.IsActive != nil { isActive = *req.IsActive }
+			isDefault := false
+			if req.IsDefault != nil { isDefault = *req.IsDefault }
+			applicableDays := req.ApplicableDays
+			if len(applicableDays) == 0 { applicableDays = []int{1, 2, 3, 4, 5, 6} }
+
+			shiftCategory := req.ShiftCategory
+			if shiftCategory == "" { shiftCategory = "regular" }
+
+			// Prepare nullable check-out
+			var coStart, coOnTimeStart, coOnTimeEnd, coEnd interface{} = nil, nil, nil, nil
+			if req.RequireCheckOut {
+				if req.CheckOutStart != "" { coStart = req.CheckOutStart }
+				if req.CheckOutOnTimeStart != "" { coOnTimeStart = req.CheckOutOnTimeStart }
+				if req.CheckOutOnTimeEnd != "" { coOnTimeEnd = req.CheckOutOnTimeEnd }
+				if req.CheckOutEnd != "" { coEnd = req.CheckOutEnd }
+			}
+
+			// Kalau set is_default = true, nonaktifkan default lain
+			if isDefault {
+				_, _ = database.DB.Exec(
+					`UPDATE attendance_shifts SET is_default = false WHERE school_id = $1`,
+					schoolID,
+				)
+			}
+
+			var shiftID string
+			err = database.DB.QueryRow(`
+				INSERT INTO attendance_shifts (
+					school_id, name, code, description, shift_category,
+					check_in_start, check_in_on_time_start, check_in_on_time_end, check_in_end,
+					require_check_out, check_out_start, check_out_on_time_start,
+					check_out_on_time_end, check_out_end,
+					allow_early_check_in, allow_late_check_out,
+					auto_close_minutes_after_check_in, auto_close_minutes_after_check_out,
+					early_threshold_minutes, late_tolerance_minutes, early_leave_tolerance_minutes,
+					applicable_days, is_active, is_default, created_by
+				) VALUES (
+					$1, $2, $3, NULLIF($4, ''), $5,
+					$6, $7, $8, $9,
+					$10, $11, $12, $13, $14,
+					$15, $16,
+					$17, $18,
+					$19, $20, $21,
+					$22, $23, $24, $25
+				) RETURNING id
+			`, schoolID, req.Name, req.Code, req.Description, shiftCategory,
+				req.CheckInStart, req.CheckInOnTimeStart, req.CheckInOnTimeEnd, req.CheckInEnd,
+				req.RequireCheckOut, coStart, coOnTimeStart, coOnTimeEnd, coEnd,
+				allowEarly, allowLateOut,
+				autoCloseIn, autoCloseOut,
+				earlyThreshold, lateTolerance, earlyLeaveTolerance,
+				applicableDays, isActive, isDefault, adminID).Scan(&shiftID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan shift: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{"message": "Shift berhasil dibuat", "id": shiftID})
+		})
+
+		// PUT: Update shift
+		api.PUT("/school-admin/attendance/shifts/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			shiftID := c.Param("id")
+			var req UpdateShiftRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid"})
+				return
+			}
+
+			// Build dynamic query — hanya update field yang diisi
+			updates := []string{}
+			args := []interface{}{}
+			argIdx := 1
+
+			if req.Name != "" {
+				updates = append(updates, fmt.Sprintf("name = $%d", argIdx))
+				args = append(args, req.Name); argIdx++
+			}
+			if req.Code != "" {
+				updates = append(updates, fmt.Sprintf("code = $%d", argIdx))
+				args = append(args, req.Code); argIdx++
+			}
+			if req.Description != "" {
+				updates = append(updates, fmt.Sprintf("description = $%d", argIdx))
+				args = append(args, req.Description); argIdx++
+			}
+			if req.CheckInStart != "" {
+				updates = append(updates, fmt.Sprintf("check_in_start = $%d", argIdx))
+				args = append(args, req.CheckInStart); argIdx++
+			}
+			if req.CheckInOnTimeStart != "" {
+				updates = append(updates, fmt.Sprintf("check_in_on_time_start = $%d", argIdx))
+				args = append(args, req.CheckInOnTimeStart); argIdx++
+			}
+			if req.CheckInOnTimeEnd != "" {
+				updates = append(updates, fmt.Sprintf("check_in_on_time_end = $%d", argIdx))
+				args = append(args, req.CheckInOnTimeEnd); argIdx++
+			}
+			if req.CheckInEnd != "" {
+				updates = append(updates, fmt.Sprintf("check_in_end = $%d", argIdx))
+				args = append(args, req.CheckInEnd); argIdx++
+			}
+			if req.RequireCheckOut != nil {
+				updates = append(updates, fmt.Sprintf("require_check_out = $%d", argIdx))
+				args = append(args, *req.RequireCheckOut); argIdx++
+			}
+			if req.CheckOutStart != "" {
+				updates = append(updates, fmt.Sprintf("check_out_start = $%d", argIdx))
+				args = append(args, req.CheckOutStart); argIdx++
+			}
+			if req.CheckOutOnTimeStart != "" {
+				updates = append(updates, fmt.Sprintf("check_out_on_time_start = $%d", argIdx))
+				args = append(args, req.CheckOutOnTimeStart); argIdx++
+			}
+			if req.CheckOutOnTimeEnd != "" {
+				updates = append(updates, fmt.Sprintf("check_out_on_time_end = $%d", argIdx))
+				args = append(args, req.CheckOutOnTimeEnd); argIdx++
+			}
+			if req.CheckOutEnd != "" {
+				updates = append(updates, fmt.Sprintf("check_out_end = $%d", argIdx))
+				args = append(args, req.CheckOutEnd); argIdx++
+			}
+			if req.IsActive != nil {
+				updates = append(updates, fmt.Sprintf("is_active = $%d", argIdx))
+				args = append(args, *req.IsActive); argIdx++
+			}
+
+			if len(updates) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Tidak ada field yang diupdate"})
+				return
+			}
+
+			updates = append(updates, "updated_at = NOW()")
+			query := fmt.Sprintf(
+				"UPDATE attendance_shifts SET %s WHERE id = $%d AND school_id = $%d",
+				joinStrings(updates, ", "), argIdx, argIdx+1,
+			)
+			args = append(args, shiftID, schoolID)
+
+			result, err := database.DB.Exec(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Shift tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Shift berhasil diperbarui"})
+		})
+
+		// DELETE: Hapus shift
+		api.DELETE("/school-admin/attendance/shifts/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			shiftID := c.Param("id")
+
+			// Cek apakah ada session aktif pakai shift ini
+			var activeCount int
+			_ = database.DB.QueryRow(`
+				SELECT count(*) FROM attendance_sessions
+				WHERE shift_id = $1 AND status IN ('open', 'scheduled')
+			`, shiftID).Scan(&activeCount)
+
+			if activeCount > 0 {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": fmt.Sprintf("Tidak bisa hapus: ada %d sesi aktif pakai shift ini", activeCount),
+				})
+				return
+			}
+
+			result, err := database.DB.Exec(
+				`DELETE FROM attendance_shifts WHERE id = $1 AND school_id = $2`,
+				shiftID, schoolID,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Shift tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Shift berhasil dihapus"})
+		})
+
+		// ==========================================
+		// CLASS SHIFT ASSIGNMENTS
+		// ==========================================
+
+		// GET: List assignments
+		api.GET("/school-admin/attendance/assignments", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			classGroupID := c.Query("class_group_id")
+			shiftID := c.Query("shift_id")
+
+			query := `
+				SELECT 
+					csa.id, csa.class_group_id, csa.class_sub_group_id, csa.shift_id,
+					csa.priority, csa.is_primary,
+					csa.override_check_in_start, csa.override_check_in_end,
+					csa.override_check_out_start, csa.override_check_out_end,
+					csa.effective_from, csa.effective_to, csa.is_active,
+					csa.created_at,
+					COALESCE(cg.name, '') AS class_group_name,
+					COALESCE(csg.name, '') AS class_sub_group_name,
+					COALESCE(s.name, '') AS shift_name,
+					COALESCE(s.code, '') AS shift_code
+				FROM class_shift_assignments csa
+				LEFT JOIN class_groups cg ON csa.class_group_id = cg.id
+				LEFT JOIN class_sub_groups csg ON csa.class_sub_group_id = csg.id
+				LEFT JOIN attendance_shifts s ON csa.shift_id = s.id
+				WHERE csa.school_id = $1
+			`
+			args := []any{schoolID}
+			argIdx := 2
+
+			if classGroupID != "" {
+				query += fmt.Sprintf(" AND csa.class_group_id = $%d", argIdx)
+				args = append(args, classGroupID); argIdx++
+			}
+			if shiftID != "" {
+				query += fmt.Sprintf(" AND csa.shift_id = $%d", argIdx)
+				args = append(args, shiftID); argIdx++
+			}
+
+			query += " ORDER BY csa.is_primary DESC, csa.priority ASC"
+
+			rows, err := database.DB.Query(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type AssignmentItem struct {
+				ID                     string     `json:"id"`
+				ClassGroupID           *string    `json:"class_group_id"`
+				ClassSubGroupID        *string    `json:"class_sub_group_id"`
+				ShiftID                string     `json:"shift_id"`
+				Priority               int        `json:"priority"`
+				IsPrimary              bool       `json:"is_primary"`
+				OverrideCheckInStart   *string    `json:"override_check_in_start"`
+				OverrideCheckInEnd     *string    `json:"override_check_in_end"`
+				OverrideCheckOutStart  *string    `json:"override_check_out_start"`
+				OverrideCheckOutEnd    *string    `json:"override_check_out_end"`
+				EffectiveFrom          *string    `json:"effective_from"`
+				EffectiveTo            *string    `json:"effective_to"`
+				IsActive               bool       `json:"is_active"`
+				CreatedAt              time.Time  `json:"created_at"`
+				ClassGroupName         string     `json:"class_group_name"`
+				ClassSubGroupName      string     `json:"class_sub_group_name"`
+				ShiftName              string     `json:"shift_name"`
+				ShiftCode              string     `json:"shift_code"`
+			}
+
+			var list []AssignmentItem
+			for rows.Next() {
+				var a AssignmentItem
+				var cgID, csgID sql.NullString
+				var ociStart, ociEnd, ocoStart, ocoEnd sql.NullString
+				var effFrom, effTo sql.NullTime
+
+				if err := rows.Scan(
+					&a.ID, &cgID, &csgID, &a.ShiftID,
+					&a.Priority, &a.IsPrimary,
+					&ociStart, &ociEnd, &ocoStart, &ocoEnd,
+					&effFrom, &effTo, &a.IsActive, &a.CreatedAt,
+					&a.ClassGroupName, &a.ClassSubGroupName, &a.ShiftName, &a.ShiftCode,
+				); err == nil {
+					if cgID.Valid { a.ClassGroupID = &cgID.String }
+					if csgID.Valid { a.ClassSubGroupID = &csgID.String }
+					if ociStart.Valid { t, _ := time.Parse("15:04:05", ociStart.String); s := t.Format("15:04"); a.OverrideCheckInStart = &s }
+					if ociEnd.Valid { t, _ := time.Parse("15:04:05", ociEnd.String); s := t.Format("15:04"); a.OverrideCheckInEnd = &s }
+					if ocoStart.Valid { t, _ := time.Parse("15:04:05", ocoStart.String); s := t.Format("15:04"); a.OverrideCheckOutStart = &s }
+					if ocoEnd.Valid { t, _ := time.Parse("15:04:05", ocoEnd.String); s := t.Format("15:04"); a.OverrideCheckOutEnd = &s }
+					if effFrom.Valid { s := effFrom.Time.Format("2006-01-02"); a.EffectiveFrom = &s }
+					if effTo.Valid { s := effTo.Time.Format("2006-01-02"); a.EffectiveTo = &s }
+
+					list = append(list, a)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"assignments": list, "total": len(list)})
+		})
+
+		// POST: Create assignment
+		api.POST("/school-admin/attendance/assignments", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			var req CreateClassShiftAssignmentRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid"})
+				return
+			}
+
+			if req.ClassGroupID == "" && req.ClassSubGroupID == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Minimal isi class_group_id atau class_sub_group_id"})
+				return
+			}
+
+			priority := req.Priority
+			if priority == 0 { priority = 1 }
+			isPrimary := true
+			if req.IsPrimary != nil { isPrimary = *req.IsPrimary }
+
+			var classGroupID, classSubGroupID interface{} = nil, nil
+			if req.ClassGroupID != "" { classGroupID = req.ClassGroupID }
+			if req.ClassSubGroupID != "" { classSubGroupID = req.ClassSubGroupID }
+
+			var ociStart, ociEnd, ocoStart, ocoEnd interface{} = nil, nil, nil, nil
+			if req.OverrideCheckInStart != "" { ociStart = req.OverrideCheckInStart }
+			if req.OverrideCheckInEnd != "" { ociEnd = req.OverrideCheckInEnd }
+			if req.OverrideCheckOutStart != "" { ocoStart = req.OverrideCheckOutStart }
+			if req.OverrideCheckOutEnd != "" { ocoEnd = req.OverrideCheckOutEnd }
+
+			var effFrom, effTo interface{} = nil, nil
+			if req.EffectiveFrom != "" { effFrom = req.EffectiveFrom }
+			if req.EffectiveTo != "" { effTo = req.EffectiveTo }
+
+			var assignmentID string
+			err = database.DB.QueryRow(`
+				INSERT INTO class_shift_assignments (
+					school_id, class_group_id, class_sub_group_id, shift_id,
+					priority, is_primary,
+					override_check_in_start, override_check_in_end,
+					override_check_out_start, override_check_out_end,
+					effective_from, effective_to, created_by
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				RETURNING id
+			`, schoolID, classGroupID, classSubGroupID, req.ShiftID,
+				priority, isPrimary,
+				ociStart, ociEnd, ocoStart, ocoEnd,
+				effFrom, effTo, adminID).Scan(&assignmentID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{"message": "Assignment berhasil dibuat", "id": assignmentID})
+		})
+
+		// DELETE: Hapus assignment
+		api.DELETE("/school-admin/attendance/assignments/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			result, err := database.DB.Exec(
+				`DELETE FROM class_shift_assignments WHERE id = $1 AND school_id = $2`,
+				c.Param("id"), schoolID,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Assignment tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Assignment berhasil dihapus"})
+		})
+
+				// ==========================================
+		// STUDENT QR CODES
+		// ==========================================
+
+		// GET: List QR codes siswa
+		api.GET("/school-admin/students/qr-list", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT 
+					sqc.id, sqc.student_id, sqc.qr_token, sqc.is_active,
+					sqc.generated_at, sqc.regenerated_count,
+					s.full_name, COALESCE(s.nisn, ''), COALESCE(s.student_number, '')
+				FROM student_qr_codes sqc
+				JOIN students s ON sqc.student_id = s.id
+				WHERE sqc.school_id = $1
+				ORDER BY s.full_name ASC
+			`, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat QR: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type QRItem struct {
+				ID                string    `json:"id"`
+				StudentID         string    `json:"student_id"`
+				QRToken           string    `json:"qr_token"`
+				IsActive          bool      `json:"is_active"`
+				GeneratedAt       time.Time `json:"generated_at"`
+				RegeneratedCount  int       `json:"regenerated_count"`
+				StudentName       string    `json:"student_name"`
+				NISN              string    `json:"nisn"`
+				StudentNumber     string    `json:"student_number"`
+			}
+
+			var list []QRItem
+			for rows.Next() {
+				var q QRItem
+				if err := rows.Scan(
+					&q.ID, &q.StudentID, &q.QRToken, &q.IsActive,
+					&q.GeneratedAt, &q.RegeneratedCount,
+					&q.StudentName, &q.NISN, &q.StudentNumber,
+				); err == nil {
+					list = append(list, q)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"qr_codes": list, "total": len(list)})
+		})
+
+		// POST: Generate QR untuk 1 siswa
+		api.POST("/school-admin/students/:id/generate-qr", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+			studentID := c.Param("id")
+
+			// Validasi siswa milik sekolah
+			var exists string
+			err = database.DB.QueryRow(`
+				SELECT id FROM students WHERE id = $1 AND school_id = $2
+			`, studentID, schoolID).Scan(&exists)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Siswa tidak ditemukan"})
+				return
+			}
+
+			// Cek apakah sudah punya QR
+			var existingID string
+			err = database.DB.QueryRow(`
+				SELECT id FROM student_qr_codes WHERE student_id = $1
+			`, studentID).Scan(&existingID)
+			if err == nil && existingID != "" {
+				c.JSON(http.StatusConflict, gin.H{"error": "Siswa ini sudah punya QR code"})
+				return
+			}
+
+			// Generate token
+			token := generateQRToken()
+
+			var qrID string
+			err = database.DB.QueryRow(`
+				INSERT INTO student_qr_codes (student_id, school_id, qr_token, generated_by)
+				VALUES ($1, $2, $3, $4)
+				RETURNING id
+			`, studentID, schoolID, token, adminID).Scan(&qrID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan QR: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message":  "QR berhasil dibuat",
+				"id":       qrID,
+				"qr_token": token,
+			})
+		})
+
+		// POST: Generate QR bulk
+		api.POST("/school-admin/students/generate-qr-bulk", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			var req GenerateQRRequest
+			_ = c.ShouldBindJSON(&req)
+
+			// Cari siswa yang belum punya QR
+			query := `
+				SELECT s.id FROM students s
+				LEFT JOIN student_qr_codes sqc ON sqc.student_id = s.id
+				WHERE s.school_id = $1 AND s.is_active = TRUE AND sqc.id IS NULL
+			`
+			args := []any{schoolID}
+			argIdx := 2
+
+			if req.ClassSubGroupID != "" {
+				query += fmt.Sprintf(" AND s.class_sub_group_id = $%d", argIdx)
+				args = append(args, req.ClassSubGroupID)
+				argIdx++
+			}
+
+			rows, err := database.DB.Query(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal query siswa: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			var studentIDs []string
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err == nil {
+					studentIDs = append(studentIDs, id)
+				}
+			}
+
+			if len(studentIDs) == 0 {
+				c.JSON(http.StatusOK, gin.H{"message": "Semua siswa sudah punya QR", "generated": 0})
+				return
+			}
+
+			// Batch insert
+			tx, err := database.DB.Begin()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mulai transaksi"})
+				return
+			}
+			defer tx.Rollback()
+
+			generated := 0
+			for _, sid := range studentIDs {
+				token := generateQRToken()
+				_, err := tx.Exec(`
+					INSERT INTO student_qr_codes (student_id, school_id, qr_token, generated_by)
+					VALUES ($1, $2, $3, $4)
+				`, sid, schoolID, token, adminID)
+				if err == nil {
+					generated++
+				}
+			}
+
+			if err := tx.Commit(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal commit"})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message":   fmt.Sprintf("%d QR berhasil dibuat", generated),
+				"generated": generated,
+			})
+		})
+
+		// POST: Regenerate QR siswa
+		api.POST("/school-admin/students/:id/regenerate-qr", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			studentID := c.Param("id")
+
+			// Cek QR existing
+			var qrID string
+			err = database.DB.QueryRow(`
+				SELECT id FROM student_qr_codes 
+				WHERE student_id = $1 AND school_id = $2
+			`, studentID, schoolID).Scan(&qrID)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "QR tidak ditemukan"})
+				return
+			}
+
+			newToken := generateQRToken()
+			_, err = database.DB.Exec(`
+				UPDATE student_qr_codes SET
+					qr_token = $1,
+					regenerated_count = regenerated_count + 1,
+					generated_at = NOW(),
+					updated_at = NOW()
+				WHERE id = $2
+			`, newToken, qrID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal regenerate: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":  "QR berhasil di-regenerate",
+				"qr_token": newToken,
+			})
+		})
+
+		// ==========================================
+		// ATTENDANCE SESSIONS
+		// ==========================================
+
+		// GET: List semua sessions
+		api.GET("/school-admin/attendance/sessions", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			// Filter opsional
+			dateFrom := c.Query("from")
+			dateTo := c.Query("to")
+			status := c.Query("status")
+			limit := c.DefaultQuery("limit", "100")
+
+			query := `
+				SELECT 
+					ases.id, ases.title, ases.session_date, ases.status,
+					ases.shift_id, COALESCE(sh.name, '') AS shift_name, COALESCE(sh.code, '') AS shift_code,
+					ases.class_group_id, COALESCE(cg.name, '') AS class_group_name,
+					ases.class_sub_group_id, COALESCE(csg.name, '') AS class_sub_group_name,
+					ases.total_students, ases.total_check_in, ases.total_check_out,
+					ases.total_absent,
+					ases.opened_at, ases.closed_at,
+					ases.created_at
+				FROM attendance_sessions ases
+				LEFT JOIN attendance_shifts sh ON ases.shift_id = sh.id
+				LEFT JOIN class_groups cg ON ases.class_group_id = cg.id
+				LEFT JOIN class_sub_groups csg ON ases.class_sub_group_id = csg.id
+				WHERE ases.school_id = $1
+			`
+			args := []any{schoolID}
+			argIdx := 2
+
+			if dateFrom != "" {
+				query += fmt.Sprintf(" AND ases.session_date >= $%d", argIdx)
+				args = append(args, dateFrom); argIdx++
+			}
+			if dateTo != "" {
+				query += fmt.Sprintf(" AND ases.session_date <= $%d", argIdx)
+				args = append(args, dateTo); argIdx++
+			}
+			if status != "" {
+				query += fmt.Sprintf(" AND ases.status = $%d", argIdx)
+				args = append(args, status); argIdx++
+			}
+
+			query += fmt.Sprintf(" ORDER BY ases.session_date DESC, ases.created_at DESC LIMIT $%d", argIdx)
+			args = append(args, limit)
+
+			rows, err := database.DB.Query(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat sesi: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type SessionItem struct {
+				ID                 string     `json:"id"`
+				Title              string     `json:"title"`
+				SessionDate        string     `json:"session_date"`
+				Status             string     `json:"status"`
+				ShiftID            string     `json:"shift_id"`
+				ShiftName          string     `json:"shift_name"`
+				ShiftCode          string     `json:"shift_code"`
+				ClassGroupID       *string    `json:"class_group_id"`
+				ClassGroupName     string     `json:"class_group_name"`
+				ClassSubGroupID    *string    `json:"class_sub_group_id"`
+				ClassSubGroupName  string     `json:"class_sub_group_name"`
+				TotalStudents      int        `json:"total_students"`
+				TotalCheckIn       int        `json:"total_check_in"`
+				TotalCheckOut      int        `json:"total_check_out"`
+				TotalAbsent        int        `json:"total_absent"`
+				OpenedAt           *time.Time `json:"opened_at"`
+				ClosedAt           *time.Time `json:"closed_at"`
+				CreatedAt          time.Time  `json:"created_at"`
+			}
+
+			var sessions []SessionItem
+			for rows.Next() {
+				var s SessionItem
+				var dateVal time.Time
+				var cgID, csgID sql.NullString
+				var openedAt, closedAt sql.NullTime
+
+				if err := rows.Scan(
+					&s.ID, &s.Title, &dateVal, &s.Status,
+					&s.ShiftID, &s.ShiftName, &s.ShiftCode,
+					&cgID, &s.ClassGroupName,
+					&csgID, &s.ClassSubGroupName,
+					&s.TotalStudents, &s.TotalCheckIn, &s.TotalCheckOut,
+					&s.TotalAbsent,
+					&openedAt, &closedAt, &s.CreatedAt,
+				); err == nil {
+					s.SessionDate = dateVal.Format("2006-01-02")
+					if cgID.Valid { s.ClassGroupID = &cgID.String }
+					if csgID.Valid { s.ClassSubGroupID = &csgID.String }
+					if openedAt.Valid { s.OpenedAt = &openedAt.Time }
+					if closedAt.Valid { s.ClosedAt = &closedAt.Time }
+					sessions = append(sessions, s)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"sessions": sessions, "total": len(sessions)})
+		})
+
+		// GET: Today's sessions (untuk dashboard)
+		api.GET("/school-admin/attendance/sessions/today", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT 
+					ases.id, ases.title, ases.session_date, ases.status,
+					ases.shift_id, COALESCE(sh.name, '') AS shift_name,
+					ases.class_group_id, COALESCE(cg.name, '') AS class_group_name,
+					ases.total_students, ases.total_check_in, ases.total_absent
+				FROM attendance_sessions ases
+				LEFT JOIN attendance_shifts sh ON ases.shift_id = sh.id
+				LEFT JOIN class_groups cg ON ases.class_group_id = cg.id
+				WHERE ases.school_id = $1 
+					AND ases.session_date = CURRENT_DATE
+					AND ases.status IN ('scheduled', 'open')
+				ORDER BY ases.created_at ASC
+			`, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type TodayItem struct {
+				ID              string  `json:"id"`
+				Title           string  `json:"title"`
+				SessionDate     string  `json:"session_date"`
+				Status          string  `json:"status"`
+				ShiftID         string  `json:"shift_id"`
+				ShiftName       string  `json:"shift_name"`
+				ClassGroupID    *string `json:"class_group_id"`
+				ClassGroupName  string  `json:"class_group_name"`
+				TotalStudents   int     `json:"total_students"`
+				TotalCheckIn    int     `json:"total_check_in"`
+				TotalAbsent     int     `json:"total_absent"`
+			}
+
+			var sessions []TodayItem
+			for rows.Next() {
+				var s TodayItem
+				var dateVal time.Time
+				var cgID sql.NullString
+				if err := rows.Scan(
+					&s.ID, &s.Title, &dateVal, &s.Status,
+					&s.ShiftID, &s.ShiftName,
+					&cgID, &s.ClassGroupName,
+					&s.TotalStudents, &s.TotalCheckIn, &s.TotalAbsent,
+				); err == nil {
+					s.SessionDate = dateVal.Format("2006-01-02")
+					if cgID.Valid { s.ClassGroupID = &cgID.String }
+					sessions = append(sessions, s)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"sessions": sessions, "total": len(sessions)})
+		})
+
+		// GET: Detail session
+		api.GET("/school-admin/attendance/sessions/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			sessionID := c.Param("id")
+
+			var s struct {
+				ID                 string
+				Title              string
+				SessionDate        time.Time
+				Status             string
+				ShiftID            string
+				ShiftName          string
+				ShiftCode          string
+				ClassGroupID       sql.NullString
+				ClassGroupName     string
+				ClassSubGroupID    sql.NullString
+				ClassSubGroupName  string
+				TotalStudents      int
+				TotalCheckIn       int
+				TotalCheckOut      int
+				TotalAbsent        int
+				OpenedAt           sql.NullTime
+				ClosedAt           sql.NullTime
+			}
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					ases.id, ases.title, ases.session_date, ases.status,
+					ases.shift_id, COALESCE(sh.name, ''), COALESCE(sh.code, ''),
+					ases.class_group_id, COALESCE(cg.name, ''),
+					ases.class_sub_group_id, COALESCE(csg.name, ''),
+					ases.total_students, ases.total_check_in, ases.total_check_out,
+					ases.total_absent, ases.opened_at, ases.closed_at
+				FROM attendance_sessions ases
+				LEFT JOIN attendance_shifts sh ON ases.shift_id = sh.id
+				LEFT JOIN class_groups cg ON ases.class_group_id = cg.id
+				LEFT JOIN class_sub_groups csg ON ases.class_sub_group_id = csg.id
+				WHERE ases.id = $1 AND ases.school_id = $2
+			`, sessionID, schoolID).Scan(
+				&s.ID, &s.Title, &s.SessionDate, &s.Status,
+				&s.ShiftID, &s.ShiftName, &s.ShiftCode,
+				&s.ClassGroupID, &s.ClassGroupName,
+				&s.ClassSubGroupID, &s.ClassSubGroupName,
+				&s.TotalStudents, &s.TotalCheckIn, &s.TotalCheckOut,
+				&s.TotalAbsent, &s.OpenedAt, &s.ClosedAt,
+			)
+
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Sesi tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			result := gin.H{
+				"id":                  s.ID,
+				"title":               s.Title,
+				"session_date":        s.SessionDate.Format("2006-01-02"),
+				"status":              s.Status,
+				"shift_id":            s.ShiftID,
+				"shift_name":          s.ShiftName,
+				"shift_code":          s.ShiftCode,
+				"class_group_name":    s.ClassGroupName,
+				"class_sub_group_name": s.ClassSubGroupName,
+				"total_students":      s.TotalStudents,
+				"total_check_in":      s.TotalCheckIn,
+				"total_check_out":     s.TotalCheckOut,
+				"total_absent":        s.TotalAbsent,
+			}
+			if s.ClassGroupID.Valid { result["class_group_id"] = s.ClassGroupID.String }
+			if s.ClassSubGroupID.Valid { result["class_sub_group_id"] = s.ClassSubGroupID.String }
+			if s.OpenedAt.Valid { result["opened_at"] = s.OpenedAt.Time }
+			if s.ClosedAt.Valid { result["closed_at"] = s.ClosedAt.Time }
+
+			c.JSON(http.StatusOK, gin.H{"session": result})
+		})
+
+		// POST: Buat session baru
+		api.POST("/school-admin/attendance/sessions", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			var req CreateAttendanceSessionRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// Ambil shift config
+			var shiftName, shiftCode string
+			var checkInStart, checkInEnd time.Time
+			var requireCheckOut bool
+			var shiftConfigJSON []byte
+
+			err = database.DB.QueryRow(`
+				SELECT name, code, check_in_start, check_in_end, require_check_out,
+					row_to_json(attendance_shifts)
+				FROM attendance_shifts
+				WHERE id = $1 AND school_id = $2
+			`, req.ShiftID, schoolID).Scan(
+				&shiftName, &shiftCode, &checkInStart, &checkInEnd, &requireCheckOut, &shiftConfigJSON,
+			)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Shift tidak ditemukan"})
+				return
+			}
+
+			// Session date (default today)
+			sessionDate := req.SessionDate
+			if sessionDate == "" {
+				sessionDate = time.Now().Format("2006-01-02")
+			}
+
+			// Title (auto-generate jika kosong)
+			title := req.Title
+			if title == "" {
+				title = fmt.Sprintf("%s - %s", shiftName, sessionDate)
+			}
+
+			// Count total_students berdasarkan filter kelas
+			countQuery := `SELECT COUNT(*) FROM students WHERE school_id = $1 AND is_active = TRUE`
+			countArgs := []any{schoolID}
+			countIdx := 2
+
+			var classGroupID, classSubGroupID interface{} = nil, nil
+			if req.ClassGroupID != "" {
+				classGroupID = req.ClassGroupID
+				countQuery += fmt.Sprintf(" AND class_group_id = $%d", countIdx)
+				countArgs = append(countArgs, req.ClassGroupID)
+				countIdx++
+			}
+			if req.ClassSubGroupID != "" {
+				classSubGroupID = req.ClassSubGroupID
+				countQuery += fmt.Sprintf(" AND class_sub_group_id = $%d", countIdx)
+				countArgs = append(countArgs, req.ClassSubGroupID)
+				countIdx++
+			}
+
+			var totalStudents int
+			_ = database.DB.QueryRow(countQuery, countArgs...).Scan(&totalStudents)
+
+			// Auto-close time = session_date + check_in_end + auto_close_minutes
+			autoCloseMinutes := 120
+			var acm sql.NullInt64
+			_ = database.DB.QueryRow(`
+				SELECT auto_close_minutes_after_check_in FROM attendance_shifts WHERE id = $1
+			`, req.ShiftID).Scan(&acm)
+			if acm.Valid {
+				autoCloseMinutes = int(acm.Int64)
+			}
+
+			autoCloseTime := time.Date(
+				time.Now().Year(), time.Now().Month(), time.Now().Day(),
+				checkInEnd.Hour(), checkInEnd.Minute(), 0, 0, time.Local,
+			).Add(time.Duration(autoCloseMinutes) * time.Minute)
+
+			var sessionID string
+			err = database.DB.QueryRow(`
+				INSERT INTO attendance_sessions (
+					school_id, shift_id, class_group_id, class_sub_group_id,
+					title, session_date, shift_config_snapshot,
+					status, opened_by, auto_close_at, total_students, notes
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'scheduled', $8, $9, $10, NULLIF($11, ''))
+				RETURNING id
+			`, schoolID, req.ShiftID, classGroupID, classSubGroupID,
+				title, sessionDate, shiftConfigJSON,
+				adminID, autoCloseTime, totalStudents, req.Notes).Scan(&sessionID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat sesi: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message":    "Sesi berhasil dibuat",
+				"id":         sessionID,
+				"session_id": sessionID,
+			})
+		})
+
+		// POST: Open session
+		api.POST("/school-admin/attendance/sessions/:id/open", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			sessionID := c.Param("id")
+			adminID, _ := getAdminIDFromUser(c)
+
+			result, err := database.DB.Exec(`
+				UPDATE attendance_sessions SET
+					status = 'open',
+					opened_at = COALESCE(opened_at, NOW()),
+					opened_by = COALESCE(opened_by, $1),
+					updated_at = NOW()
+				WHERE id = $2 AND school_id = $3 AND status IN ('scheduled', 'open')
+			`, adminID, sessionID, schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi tidak ditemukan atau sudah ditutup"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Sesi berhasil dibuka"})
+		})
+
+		// POST: Close session (dengan auto-absent)
+		api.POST("/school-admin/attendance/sessions/:id/close", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			sessionID := c.Param("id")
+			adminID, _ := getAdminIDFromUser(c)
+
+			// Validasi session milik sekolah
+			var sStatus string
+			err = database.DB.QueryRow(`
+				SELECT status FROM attendance_sessions 
+				WHERE id = $1 AND school_id = $2
+			`, sessionID, schoolID).Scan(&sStatus)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi tidak ditemukan"})
+				return
+			}
+
+			if sStatus == "closed" || sStatus == "auto_closed" {
+				c.JSON(http.StatusConflict, gin.H{"error": "Sesi sudah ditutup"})
+				return
+			}
+
+			// Panggil function auto-mark absent
+			var absentCount int
+			err = database.DB.QueryRow(
+				`SELECT auto_mark_absent_for_session($1)`,
+				sessionID,
+			).Scan(&absentCount)
+			if err != nil {
+				fmt.Printf("[CLOSE SESSION] Auto absent error: %v\n", err)
+				absentCount = 0
+			}
+
+			// Update status
+			_, _ = database.DB.Exec(`
+				UPDATE attendance_sessions SET
+					status = 'closed',
+					closed_by = $1,
+					closed_at = NOW(),
+					updated_at = NOW()
+				WHERE id = $2
+			`, adminID, sessionID)
+
+			// Recalculate stats
+			_, _ = database.DB.Exec(`SELECT recalculate_session_stats($1)`, sessionID)
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":      "Sesi berhasil ditutup",
+				"absent_count": absentCount,
+			})
+		})
+
+		// DELETE: Hapus session
+		api.DELETE("/school-admin/attendance/sessions/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			result, err := database.DB.Exec(`
+				DELETE FROM attendance_sessions WHERE id = $1 AND school_id = $2
+			`, c.Param("id"), schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Sesi berhasil dihapus"})
+		})
+
+		// GET: Records untuk session (untuk report)
+		api.GET("/school-admin/attendance/sessions/:id/records", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			sessionID := c.Param("id")
+
+			// Ambil session info dulu
+			var classGroupID, classSubGroupID sql.NullString
+			err = database.DB.QueryRow(`
+				SELECT class_group_id, class_sub_group_id 
+				FROM attendance_sessions 
+				WHERE id = $1 AND school_id = $2
+			`, sessionID, schoolID).Scan(&classGroupID, &classSubGroupID)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi tidak ditemukan"})
+				return
+			}
+
+			// Query semua siswa target + LEFT JOIN ke records
+			query := `
+				SELECT 
+					s.id AS student_id,
+					s.full_name AS student_name,
+					COALESCE(s.nisn, '') AS nisn,
+					COALESCE(csg.name, '') AS sub_class_name,
+					ci.status AS check_in_status,
+					ci.scanned_at AS check_in_at,
+					co.status AS check_out_status,
+					co.scanned_at AS check_out_at,
+					COALESCE(ci.status = 'absent', false) AS is_absent
+				FROM students s
+				LEFT JOIN class_sub_groups csg ON s.class_sub_group_id = csg.id
+				LEFT JOIN attendance_records ci ON ci.student_id = s.id 
+					AND ci.session_id = $1 AND ci.record_type = 'check_in'
+				LEFT JOIN attendance_records co ON co.student_id = s.id 
+					AND co.session_id = $1 AND co.record_type = 'check_out'
+				WHERE s.school_id = $2 AND s.is_active = TRUE
+			`
+			args := []any{sessionID, schoolID}
+			argIdx := 3
+
+			if classGroupID.Valid {
+				query += fmt.Sprintf(" AND s.class_group_id = $%d", argIdx)
+				args = append(args, classGroupID.String)
+				argIdx++
+			}
+			if classSubGroupID.Valid {
+				query += fmt.Sprintf(" AND s.class_sub_group_id = $%d", argIdx)
+				args = append(args, classSubGroupID.String)
+				argIdx++
+			}
+
+			query += " ORDER BY s.full_name ASC"
+
+			rows, err := database.DB.Query(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal query records: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type RecordItem struct {
+				StudentID        string  `json:"student_id"`
+				StudentName      string  `json:"student_name"`
+				NISN             string  `json:"nisn"`
+				SubClassName     string  `json:"sub_class_name"`
+				CheckInStatus    *string `json:"check_in_status"`
+				CheckInTime      *string `json:"check_in_time"`
+				CheckOutStatus   *string `json:"check_out_status"`
+				CheckOutTime     *string `json:"check_out_time"`
+				IsAbsent         bool    `json:"is_absent"`
+			}
+
+			var records []RecordItem
+			for rows.Next() {
+				var r RecordItem
+				var ciStatus, coStatus sql.NullString
+				var ciAt, coAt sql.NullTime
+
+				if err := rows.Scan(
+					&r.StudentID, &r.StudentName, &r.NISN, &r.SubClassName,
+					&ciStatus, &ciAt, &coStatus, &coAt, &r.IsAbsent,
+				); err == nil {
+					if ciStatus.Valid { r.CheckInStatus = &ciStatus.String }
+					if coStatus.Valid { r.CheckOutStatus = &coStatus.String }
+					if ciAt.Valid {
+						t := ciAt.Time.Format("15:04")
+						r.CheckInTime = &t
+					}
+					if coAt.Valid {
+						t := coAt.Time.Format("15:04")
+						r.CheckOutTime = &t
+					}
+					records = append(records, r)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"records": records, "total": len(records)})
+		})
+
+				// ==========================================
+		// SCAN HANDLER (CORE)
+		// ==========================================
+
+		api.POST("/school-admin/attendance/scan", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			var req ScanQRRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// 1. Validasi session
+			var sessionStatus string
+			var shiftID string
+			var sessionClassGroupID, sessionClassSubGroupID sql.NullString
+			var checkInStart, checkInEnd time.Time
+			var requireCheckOut bool
+			var checkOutStart, checkOutEnd sql.NullTime
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					ases.status, ases.shift_id,
+					ases.class_group_id, ases.class_sub_group_id,
+					sh.check_in_start, sh.check_in_end,
+					sh.require_check_out, sh.check_out_start, sh.check_out_end
+				FROM attendance_sessions ases
+				JOIN attendance_shifts sh ON ases.shift_id = sh.id
+				WHERE ases.id = $1 AND ases.school_id = $2
+			`, req.SessionID, schoolID).Scan(
+				&sessionStatus, &shiftID,
+				&sessionClassGroupID, &sessionClassSubGroupID,
+				&checkInStart, &checkInEnd,
+				&requireCheckOut, &checkOutStart, &checkOutEnd,
+			)
+
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi tidak ditemukan"})
+				return
+			}
+
+			if sessionStatus != "open" && sessionStatus != "scheduled" {
+				c.JSON(http.StatusConflict, gin.H{"error": "Sesi sudah ditutup"})
+				return
+			}
+
+			// Auto-open session jika masih scheduled
+			if sessionStatus == "scheduled" {
+				_, _ = database.DB.Exec(`
+					UPDATE attendance_sessions SET status = 'open', opened_at = NOW(), opened_by = $1
+					WHERE id = $2
+				`, adminID, req.SessionID)
+			}
+
+			// 2. Cari student by QR token
+			var studentID, studentName, studentNISN string
+			var studentClassGroupID, studentClassSubGroupID sql.NullString
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					s.id, s.full_name, COALESCE(s.nisn, ''),
+					s.class_group_id, s.class_sub_group_id
+				FROM student_qr_codes sqc
+				JOIN students s ON sqc.student_id = s.id
+				WHERE sqc.qr_token = $1 AND sqc.school_id = $2 AND sqc.is_active = TRUE
+			`, req.QRToken, schoolID).Scan(
+				&studentID, &studentName, &studentNISN,
+				&studentClassGroupID, &studentClassSubGroupID,
+			)
+
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{
+					"error":   "QR tidak dikenal",
+					"qr_token": req.QRToken,
+				})
+				return
+			}
+
+			// 3. Validasi kelas
+			if sessionClassGroupID.Valid && studentClassGroupID.Valid {
+				if sessionClassGroupID.String != studentClassGroupID.String {
+					c.JSON(http.StatusBadRequest, gin.H{
+						"error":   "Siswa bukan bagian dari kelas yang di-absensi",
+						"student": gin.H{"full_name": studentName, "nisn": studentNISN},
+					})
+					return
+				}
+			}
+			if sessionClassSubGroupID.Valid && studentClassSubGroupID.Valid {
+				if sessionClassSubGroupID.String != studentClassSubGroupID.String {
+					c.JSON(http.StatusBadRequest, gin.H{
+						"error":   "Siswa bukan bagian dari sub kelas yang di-absensi",
+						"student": gin.H{"full_name": studentName, "nisn": studentNISN},
+					})
+					return
+				}
+			}
+
+			// 4. Tentukan mode: check_in atau check_out
+			var hasCheckIn, hasCheckOut bool
+			_ = database.DB.QueryRow(`
+				SELECT 
+					EXISTS(SELECT 1 FROM attendance_records WHERE session_id = $1 AND student_id = $2 AND record_type = 'check_in'),
+					EXISTS(SELECT 1 FROM attendance_records WHERE session_id = $1 AND student_id = $2 AND record_type = 'check_out')
+			`, req.SessionID, studentID).Scan(&hasCheckIn, &hasCheckOut)
+
+			// Force mode dari request (override)
+			mode := ""
+			if req.ForceMode == "check_in" || req.ForceMode == "check_out" {
+				mode = req.ForceMode
+			} else {
+				if !hasCheckIn {
+					mode = "check_in"
+				} else if requireCheckOut && !hasCheckOut {
+					mode = "check_out"
+				} else {
+					// Sudah check-in & tidak butuh check-out ATAU sudah check-out
+					c.JSON(http.StatusConflict, gin.H{
+						"duplicate": true,
+						"error":     "Siswa sudah tercatat sebelumnya",
+						"student":   gin.H{"full_name": studentName, "nisn": studentNISN},
+					})
+					return
+				}
+			}
+
+			// 5. Hitung status berdasarkan waktu
+			now := time.Now()
+			currentTime := time.Date(2000, 1, 1, now.Hour(), now.Minute(), now.Second(), 0, time.UTC)
+
+			var status string
+			var deviation int
+
+			if mode == "check_in" {
+				status = determineCheckInStatus(
+					checkInStart, checkInEnd, currentTime,
+				)
+				// Hitung deviation
+				if currentTime.Before(checkInStart) {
+					deviation = -int(checkInStart.Sub(currentTime).Minutes())
+				} else if currentTime.After(checkInEnd) {
+					deviation = int(currentTime.Sub(checkInEnd).Minutes())
+				}
+			} else {
+				if !checkOutStart.Valid || !checkOutEnd.Valid {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Shift ini tidak support check-out"})
+					return
+				}
+				status = determineCheckOutStatus(
+					checkOutStart.Time, checkOutEnd.Time, currentTime,
+				)
+			}
+
+			// 6. Insert record
+			var recordID string
+			err = database.DB.QueryRow(`
+				INSERT INTO attendance_records (
+					session_id, student_id, school_id,
+					record_type, status, scanned_at, scanned_by,
+					scan_method, deviation_minutes
+				) VALUES ($1, $2, $3, $4, $5, NOW(), $6, 'qr', $7)
+				RETURNING id
+			`, req.SessionID, studentID, schoolID,
+				mode, status, adminID, deviation).Scan(&recordID)
+
+			if err != nil {
+				// Kemungkinan duplikat
+				fmt.Printf("[SCAN] Insert error: %v\n", err)
+				c.JSON(http.StatusConflict, gin.H{
+					"duplicate": true,
+					"error":     "Siswa sudah tercatat di sesi ini",
+					"student":   gin.H{"full_name": studentName, "nisn": studentNISN},
+				})
+				return
+			}
+
+			// 7. Update counter di session
+			if mode == "check_in" {
+				_, _ = database.DB.Exec(`
+					UPDATE attendance_sessions 
+					SET total_check_in = total_check_in + 1,
+						total_on_time = CASE WHEN $2 IN ('on_time', 'early') THEN total_on_time + 1 ELSE total_on_time END,
+						total_late = CASE WHEN $2 IN ('late', 'very_late') THEN total_late + 1 ELSE total_late END,
+						updated_at = NOW()
+					WHERE id = $1
+				`, req.SessionID, status)
+			} else {
+				_, _ = database.DB.Exec(`
+					UPDATE attendance_sessions 
+					SET total_check_out = total_check_out + 1,
+						updated_at = NOW()
+					WHERE id = $1
+				`, req.SessionID)
+			}
+
+			// 8. Upsert summary
+			_, _ = database.DB.Exec(`
+				INSERT INTO student_attendance_summary 
+					(student_id, school_id, session_id, summary_date, 
+					 check_in_status, check_in_time,
+					 check_out_status, check_out_time,
+					 is_complete, is_absent)
+				VALUES ($1, $2, $3, CURRENT_DATE,
+					CASE WHEN $4 = 'check_in' THEN $5::text ELSE NULL END,
+					CASE WHEN $4 = 'check_in' THEN $6::time ELSE NULL END,
+					CASE WHEN $4 = 'check_out' THEN $5::text ELSE NULL END,
+					CASE WHEN $4 = 'check_out' THEN $6::time ELSE NULL END,
+					false, false)
+				ON CONFLICT (student_id, session_id) DO UPDATE SET
+					check_in_status = CASE WHEN $4 = 'check_in' THEN $5 ELSE student_attendance_summary.check_in_status END,
+					check_in_time = CASE WHEN $4 = 'check_in' THEN $6::time ELSE student_attendance_summary.check_in_time END,
+					check_out_status = CASE WHEN $4 = 'check_out' THEN $5 ELSE student_attendance_summary.check_out_status END,
+					check_out_time = CASE WHEN $4 = 'check_out' THEN $6::time ELSE student_attendance_summary.check_out_time END,
+					is_complete = CASE WHEN $4 = 'check_out' THEN true ELSE student_attendance_summary.is_complete END,
+					updated_at = NOW()
+			`, studentID, schoolID, req.SessionID,
+				mode, status, now.Format("15:04:05"))
+
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"mode":    mode,
+				"status":  status,
+				"student": gin.H{
+					"id":              studentID,
+					"full_name":       studentName,
+					"nisn":            studentNISN,
+					"sub_class_name":  studentClassSubGroupID.String,
+				},
+				"scanned_at": now,
+				"record_id":  recordID,
+			})
+		})
+
 	}
 }
