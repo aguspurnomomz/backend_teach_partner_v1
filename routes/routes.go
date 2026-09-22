@@ -336,6 +336,15 @@ func joinStrings(strs []string, sep string) string {
 	return result
 }
 
+func nowJakarta() time.Time {
+	loc, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		// Fallback: UTC+7
+		loc = time.FixedZone("WIB", 7*60*60)
+	}
+	return time.Now().In(loc)
+}
+
 func strPtr(s string) *string {
 	return &s
 }
@@ -4821,7 +4830,7 @@ func SetupRoutes(r *gin.Engine) {
 			// Session date (default today)
 			sessionDate := req.SessionDate
 			if sessionDate == "" {
-				sessionDate = time.Now().Format("2006-01-02")
+				sessionDate = nowJakarta().Format("2006-01-02")
 			}
 
 			// Title (auto-generate jika kosong)
@@ -4862,9 +4871,10 @@ func SetupRoutes(r *gin.Engine) {
 				autoCloseMinutes = int(acm.Int64)
 			}
 
+			now := nowJakarta()
 			autoCloseTime := time.Date(
-				time.Now().Year(), time.Now().Month(), time.Now().Day(),
-				checkInEnd.Hour(), checkInEnd.Minute(), 0, 0, time.Local,
+				now.Year(), now.Month(), now.Day(),
+				checkInEnd.Hour(), checkInEnd.Minute(), 0, 0, now.Location(),
 			).Add(time.Duration(autoCloseMinutes) * time.Minute)
 
 			var sessionID string
@@ -5244,7 +5254,7 @@ func SetupRoutes(r *gin.Engine) {
 			}
 
 			// 5. Hitung status berdasarkan waktu
-			now := time.Now()
+			now := nowJakarta()
 			currentTime := time.Date(2000, 1, 1, now.Hour(), now.Minute(), now.Second(), 0, time.UTC)
 
 			var status string
