@@ -2511,19 +2511,29 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			var id, schoolName, npsn, address, city, email, jenjang sql.NullString
+			var id, schoolName, npsn, address, jenjang sql.NullString
 			var isActive bool
 			var createdAt time.Time
 
 			err = database.DB.QueryRow(`
-				SELECT id, school_name, npsn, address, COALESCE(city, ''), 
-					COALESCE(email, ''), COALESCE(jenjang, 'SMP'), is_active, created_at 
+				SELECT 
+					id, 
+					school_name, 
+					npsn, 
+					COALESCE(address, ''), 
+					COALESCE(jenjang, 'SMP'), 
+					is_active, 
+					created_at 
 				FROM schools WHERE id = $1
-			`, schoolID).Scan(&id, &schoolName, &npsn, &address, &city, &email, &jenjang, &isActive, &createdAt)
+			`, schoolID).Scan(&id, &schoolName, &npsn, &address, &jenjang, &isActive, &createdAt)
 
 			if err != nil {
 				fmt.Printf("[GET PROFILE] Gagal ambil data sekolah: %v (schoolID=%s)\n", err, schoolID)
-				c.JSON(http.StatusNotFound, gin.H{"error": "Data sekolah tidak ditemukan"})
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Data sekolah tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 
@@ -2533,8 +2543,6 @@ func SetupRoutes(r *gin.Engine) {
 					"school_name": schoolName.String,
 					"npsn":        npsn.String,
 					"address":     address.String,
-					"city":        city.String,
-					"email":       email.String,
 					"jenjang":     jenjang.String,
 					"is_active":   isActive,
 					"created_at":  createdAt,
@@ -2565,9 +2573,9 @@ func SetupRoutes(r *gin.Engine) {
 
 			_, err = database.DB.Exec(`
 				UPDATE schools 
-				SET school_name = $1, npsn = $2, address = $3, city = $4, email = $5, updated_at = NOW() 
-				WHERE id = $6
-			`, req.SchoolName, req.Npsn, req.Address, req.City, req.Email, schoolID)
+				SET school_name = $1, npsn = $2, address = $3, updated_at = NOW() 
+				WHERE id = $4
+			`, req.SchoolName, req.Npsn, req.Address, schoolID)
 
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memperbarui data sekolah: " + err.Error()})
