@@ -115,6 +115,49 @@ type MoveStudentRequest struct {
 	TargetSubGroupID string `json:"target_sub_group_id" binding:"required"`
 }
 
+// ==========================================
+// SCHOOL EXAMS STRUCTS
+// ==========================================
+
+// Target kelas untuk ujian
+type ExamTargetInput struct {
+	ClassGroupID    string `json:"class_group_id"`     // opsional (kalau pilih di level kelas)
+	ClassSubGroupID string `json:"class_sub_group_id"` // bisa kosong jika semua sub kelas
+}
+
+// Question item (flexible: PG atau Essay)
+type ExamQuestionInput struct {
+	ID             string          `json:"id"`
+	Type           string          `json:"type" binding:"required,oneof=multiple_choice essay"`
+	Order          int             `json:"order"`
+	QuestionText   string          `json:"question_text" binding:"required"`
+	Options        json.RawMessage `json:"options"`         // null kalau essay
+	CorrectAnswer  string          `json:"correct_answer"`  // kosong kalau essay
+	AnswerKey      string          `json:"answer_key"`      // untuk essay
+	Rubric         json.RawMessage `json:"rubric"`          // opsional
+	Explanation    string          `json:"explanation"`
+	CognitiveLevel string          `json:"cognitive_level"`
+	Score          float64         `json:"score"`
+	MinWords       int             `json:"min_words"`
+	ImageURL       string          `json:"image_url"`
+}
+
+// Create / Update
+type CreateSchoolExamRequest struct {
+	Title           string              `json:"title" binding:"required"`
+	Description     string              `json:"description"`
+	Subject         string              `json:"subject" binding:"required"`
+	ExamType        string              `json:"exam_type"` // regular|uts|uas|remedial|tryout|quiz
+	GradeLevel      string              `json:"grade_level"`
+	Phase           string              `json:"phase"`
+	AcademicYearID  string              `json:"academic_year_id"`
+	DurationMinutes int                 `json:"duration_minutes" binding:"required,min=1"`
+	PassingScore    float64             `json:"passing_score"`
+	ScoringConfig   json.RawMessage     `json:"scoring_config"`
+	Questions       []ExamQuestionInput `json:"questions" binding:"required,min=1"`
+	Targets         []ExamTargetInput   `json:"targets"` // WAJIB diisi minimal 1
+}
+
 // Members Struct
 // ==========================================
 // TEACHER MEMBERSHIP STRUCTS
@@ -272,6 +315,12 @@ type RegenerateQRRequest struct {
 	Reason string `json:"reason"`
 }
 
+type StartExamRequest struct {
+	NISN        string `json:"nisn" binding:"required"`
+	AccessCode  string `json:"access_code" binding:"required"`
+	StudentName string `json:"student_name" binding:"required"`
+}
+
 // --- Struct Pembelian Token & Midtrans ---
 type CreateTransactionRequest struct {
 	PackageName string `json:"package_name" binding:"required"`
@@ -352,6 +401,26 @@ type SubmitExamRequest struct {
 	StudentNumber string            `json:"student_number" binding:"required"`
 	NISN          string            `json:"nisn" binding:"required"`
 	Answers       map[string]string `json:"answers" binding:"required"`
+}
+
+type SubmitLiveExamRequest struct {
+	Answers          map[string]string `json:"answers" binding:"required"`
+	TabSwitchCount   int               `json:"tab_switch_count"`
+	TimeSpentSeconds int               `json:"time_spent_seconds"`
+}
+
+type CreateScheduleRequest struct {
+    ExamID             string   `json:"exam_id" binding:"required"`
+    ScheduleDate       string   `json:"schedule_date" binding:"required"`
+    StartTime          string   `json:"start_time" binding:"required"`
+    EndTime            string   `json:"end_time" binding:"required"`
+    DurationMinutes    int      `json:"duration_minutes" binding:"required,min=1"`
+    TargetSubGroupIDs  []string `json:"target_sub_group_ids" binding:"required,min=1"`
+    Room               string   `json:"room"`
+    SupervisorName     string   `json:"supervisor_name"`
+    SessionNotes       string   `json:"session_notes"`
+    AccessCode         string   `json:"access_code" binding:"required"`
+    RequireLogin       bool     `json:"require_login"`
 }
 
 func joinStrings(strs []string, sep string) string {
@@ -766,6 +835,15 @@ func determineCheckOutStatus(checkOutStart, checkOutEnd, scanTime time.Time) str
 		}
 	}
 	return "on_time_leave"
+}
+
+func generateSessionToken() string {
+	b := make([]byte, 24)
+	for i := range b {
+		b[i] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[time.Now().UnixNano()%62]
+		time.Sleep(1 * time.Nanosecond)
+	}
+	return "SES-" + string(b)
 }
 
 func SetupRoutes(r *gin.Engine) {
@@ -1971,6 +2049,411 @@ func SetupRoutes(r *gin.Engine) {
 
 			c.JSON(http.StatusOK, gin.H{"has_submitted": false})
 		})
+
+		apiPub.POST("/exam/start", func(c *gin.Context) {
+			var req StartExamRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Data tidak lengkap: " + err.Error()})
+				return
+			}
+
+			// 1. Cari schedule dari access code
+			var scheduleID, examID, schoolID, status string
+			var scheduleDate time.Time
+			var startTime, endTime time.Time
+			var classSubGroupID, classGroupID sql.NullString
+			var requireLogin bool
+			var examTitle, subject string
+			var passingScore float64
+			var durationMinutes int
+
+			err := database.DB.QueryRow(`
+				SELECT 
+					es.id, es.exam_id, es.school_id, es.status,
+					es.schedule_date, es.start_time, es.end_time,
+					es.class_group_id, es.class_sub_group_id,
+					es.require_login, es.duration_minutes,
+					e.title, e.subject, COALESCE(e.passing_score, 0)
+				FROM exam_schedules es
+				JOIN school_exams e ON es.exam_id = e.id
+				WHERE es.access_code = $1 
+				AND es.deleted_at IS NULL
+				AND es.status IN ('scheduled', 'ongoing')
+			`, strings.ToUpper(req.AccessCode)).Scan(
+				&scheduleID, &examID, &schoolID, &status,
+				&scheduleDate, &startTime, &endTime,
+				&classGroupID, &classSubGroupID,
+				&requireLogin, &durationMinutes,
+				&examTitle, &subject, &passingScore,
+			)
+
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Kode ujian tidak valid atau ujian sudah berakhir"})
+				return
+			}
+
+			// 2. Cek waktu (boleh mulai kalau sekarang >= start_time - 10 menit dan <= end_time)
+			now := nowJakarta()
+			scheduleStart := time.Date(
+				scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
+				startTime.Hour(), startTime.Minute(), 0, 0, now.Location(),
+			)
+			scheduleEnd := time.Date(
+				scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
+				endTime.Hour(), endTime.Minute(), 0, 0, now.Location(),
+			)
+
+			if now.Before(scheduleStart.Add(-10 * time.Minute)) {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": fmt.Sprintf("Ujian belum dimulai. Mulai pukul %s", startTime.Format("15:04")),
+				})
+				return
+			}
+			if now.After(scheduleEnd) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Waktu ujian sudah berakhir"})
+				return
+			}
+
+			// 3. Cari student di class_sub_group ini pakai NISN + nama
+			var studentID, actualName, actualNISN string
+			var studentClassSubGroupID sql.NullString
+
+			err = database.DB.QueryRow(`
+				SELECT id, full_name, COALESCE(nisn, ''), class_sub_group_id
+				FROM students 
+				WHERE school_id = $1 
+				AND nisn = $2
+				AND LOWER(full_name) = LOWER($3)
+				AND is_active = TRUE
+			`, schoolID, req.NISN, req.StudentName).Scan(
+				&studentID, &actualName, &actualNISN, &studentClassSubGroupID,
+			)
+
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{
+					"error": "Data siswa tidak cocok. Periksa NISN dan nama Anda.",
+				})
+				return
+			}
+
+			// Validasi siswa di sub kelas yang tepat
+			if classSubGroupID.Valid && studentClassSubGroupID.Valid {
+				if classSubGroupID.String != studentClassSubGroupID.String {
+					c.JSON(http.StatusForbidden, gin.H{"error": "Anda bukan peserta ujian ini"})
+					return
+				}
+			}
+
+			// 4. Cek apakah sudah submit
+			var existingSubID string
+			err = database.DB.QueryRow(`
+				SELECT id FROM exam_submissions 
+				WHERE schedule_id = $1 AND student_id = $2
+			`, scheduleID, studentID).Scan(&existingSubID)
+			if err == nil && existingSubID != "" {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Anda sudah mengumpulkan ujian ini"})
+				return
+			}
+
+			// 5. Cek existing live session (kalau ada, reuse token-nya — siswa resume)
+			var existingToken string
+			var existingExpires time.Time
+			err = database.DB.QueryRow(`
+				SELECT session_token, expires_at
+				FROM exam_live_sessions
+				WHERE schedule_id = $1 AND student_id = $2 AND submitted_at IS NULL
+			`, scheduleID, studentID).Scan(&existingToken, &existingExpires)
+
+			var sessionToken string
+			var expiresAt time.Time
+
+			if err == nil && existingToken != "" {
+				// Resume
+				sessionToken = existingToken
+				expiresAt = existingExpires
+			} else {
+				// Buat session baru
+				sessionToken = generateSessionToken()
+				// expires = min(end_time, now + duration)
+				durationEnd := now.Add(time.Duration(durationMinutes) * time.Minute)
+				if durationEnd.Before(scheduleEnd) {
+					expiresAt = durationEnd
+				} else {
+					expiresAt = scheduleEnd
+				}
+
+				// Ambil questions dari exam
+				var questionsJSON []byte
+				var scoringConfig []byte
+				err = database.DB.QueryRow(`
+					SELECT questions, scoring_config FROM school_exams WHERE id = $1
+				`, examID).Scan(&questionsJSON, &scoringConfig)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat soal"})
+					return
+				}
+
+				// ==========================================
+				// SANITIZE: hapus correct_answer & answer_key dari soal!
+				// ==========================================
+				var questions []map[string]any
+				if err := json.Unmarshal(questionsJSON, &questions); err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Format soal error"})
+					return
+				}
+				for _, q := range questions {
+					delete(q, "correct_answer")
+					delete(q, "answer_key")
+					delete(q, "explanation")
+					delete(q, "rubric")
+				}
+				sanitizedJSON, _ := json.Marshal(questions)
+
+				examConfig := map[string]any{
+					"duration_minutes": durationMinutes,
+					"passing_score":    passingScore,
+					"total_score":      len(questions),
+				}
+				configJSON, _ := json.Marshal(examConfig)
+
+				_, err = database.DB.Exec(`
+					INSERT INTO exam_live_sessions (
+						schedule_id, student_id, school_id,
+						session_token,
+						student_name_snapshot, student_nisn_snapshot,
+						questions_snapshot, exam_config_snapshot,
+						started_at, expires_at,
+						ip_address, user_agent
+					) VALUES (
+						$1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb,
+						NOW(), $9, $10, $11
+					)
+				`, scheduleID, studentID, schoolID,
+					sessionToken,
+					actualName, actualNISN,
+					sanitizedJSON, configJSON,
+					expiresAt, c.ClientIP(), c.Request.UserAgent(),
+				)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat sesi ujian: " + err.Error()})
+					return
+				}
+
+				// Update schedule status ke ongoing
+				if status == "scheduled" {
+					_, _ = database.DB.Exec(`
+						UPDATE exam_schedules SET status = 'ongoing', updated_at = NOW()
+						WHERE id = $1
+					`, scheduleID)
+				}
+			}
+
+			// 6. Ambil questions_snapshot dari session
+			var questionsSnapshot []byte
+			var examConfigSnapshot []byte
+			err = database.DB.QueryRow(`
+				SELECT questions_snapshot, exam_config_snapshot
+				FROM exam_live_sessions WHERE session_token = $1
+			`, sessionToken).Scan(&questionsSnapshot, &examConfigSnapshot)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat soal"})
+				return
+			}
+
+			var questions any
+			var examConfig struct {
+				DurationMinutes int     `json:"duration_minutes"`
+				PassingScore    float64 `json:"passing_score"`
+				TotalScore      int     `json:"total_score"`
+			}
+			_ = json.Unmarshal(questionsSnapshot, &questions)
+			_ = json.Unmarshal(examConfigSnapshot, &examConfig)
+
+			c.JSON(http.StatusOK, gin.H{
+				"session_token":    sessionToken,
+				"schedule_id":      scheduleID,
+				"exam_id":          examID,
+				"student_id":       studentID,
+				"student_name":     actualName,
+				"student_nisn":     actualNISN,
+				"exam_title":       examTitle,
+				"exam_subject":     subject,
+				"duration_minutes": examConfig.DurationMinutes,
+				"passing_score":    examConfig.PassingScore,
+				"total_score":      examConfig.TotalScore,
+				"started_at":       now.Format(time.RFC3339),
+				"expires_at":       expiresAt.Format(time.RFC3339),
+				"questions":        questions,
+			})
+		})
+
+		apiPub.POST("/exam/:sessionToken/submit", func(c *gin.Context) {
+			sessionToken := c.Param("sessionToken")
+
+			var req SubmitLiveExamRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// 1. Ambil session
+			var sessionID, scheduleID, examID, schoolID, studentID string
+			var studentName, studentNISN string
+			var questionsSnapshot []byte
+			var submittedAt sql.NullTime
+
+			err := database.DB.QueryRow(`
+				SELECT 
+					id, schedule_id, school_id, student_id,
+					student_name_snapshot, student_nisn_snapshot,
+					questions_snapshot, submitted_at
+				FROM exam_live_sessions
+				WHERE session_token = $1
+			`, sessionToken).Scan(
+				&sessionID, &scheduleID, &schoolID, &studentID,
+				&studentName, &studentNISN,
+				&questionsSnapshot, &submittedAt,
+			)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak valid"})
+				return
+			}
+
+			if submittedAt.Valid {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Ujian sudah dikumpulkan sebelumnya"})
+				return
+			}
+
+			// 2. Ambil exam info (KKM, total score)
+			var passingScore float64
+			var examQuestionsJSON []byte
+			err = database.DB.QueryRow(`
+				SELECT COALESCE(passing_score, 0), questions 
+				FROM school_exams 
+				WHERE id = (SELECT exam_id FROM exam_schedules WHERE id = $1)
+			`, scheduleID).Scan(&passingScore, &examQuestionsJSON)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal ambil data ujian"})
+				return
+			}
+
+			// 3. Auto-grade PG
+			var examQuestions []struct {
+				ID            string  `json:"id"`
+				Type          string  `json:"type"`
+				CorrectAnswer string  `json:"correct_answer"`
+				AnswerKey     string  `json:"answer_key"`
+				Score         float64 `json:"score"`
+			}
+			_ = json.Unmarshal(examQuestionsJSON, &examQuestions)
+
+			var totalScore float64
+			var maxScore float64
+			var pgScore float64
+			var hasEssay bool
+
+			answersDetail := []map[string]any{}
+
+			for _, q := range examQuestions {
+				maxScore += q.Score
+				studentAns := strings.TrimSpace(req.Answers[q.ID])
+
+				detail := map[string]any{
+					"question_id": q.ID,
+					"type":        q.Type,
+					"answer":      studentAns,
+					"max_score":   q.Score,
+				}
+
+				if q.Type == "multiple_choice" {
+					isCorrect := strings.EqualFold(studentAns, strings.TrimSpace(q.CorrectAnswer))
+					detail["is_correct"] = isCorrect
+					if isCorrect {
+						detail["score"] = q.Score
+						totalScore += q.Score
+						pgScore += q.Score
+					} else {
+						detail["score"] = 0.0
+					}
+				} else {
+					// Essay — pending manual grading
+					detail["score"] = nil
+					detail["is_correct"] = nil
+					hasEssay = true
+				}
+
+				answersDetail = append(answersDetail, detail)
+			}
+
+			percentage := 0.0
+			if maxScore > 0 {
+				percentage = (totalScore / maxScore) * 100
+			}
+
+			status := "graded"
+			if hasEssay {
+				status = "graded_with_pending"
+			}
+
+			// 4. Insert submission
+			answersJSON, _ := json.Marshal(answersDetail)
+
+			var submissionID string
+			err = database.DB.QueryRow(`
+				INSERT INTO exam_submissions (
+					schedule_id, exam_id, school_id, student_id,
+					student_name, student_nisn,
+					started_at, submitted_at,
+					answers, total_score, max_score, percentage, is_passed,
+					status, tab_switch_count, time_spent_seconds,
+					ip_address, user_agent
+				) VALUES (
+					$1, $2, $3, $4, $5, $6,
+					(SELECT started_at FROM exam_live_sessions WHERE id = $7),
+					NOW(),
+					$8::jsonb, $9, $10, $11, $12,
+					$13, $14, $15, $16, $17
+				) RETURNING id
+			`, scheduleID, examID, schoolID, studentID,
+				studentName, studentNISN,
+				sessionID,
+				answersJSON, totalScore, maxScore, percentage, percentage >= passingScore,
+				status, req.TabSwitchCount, req.TimeSpentSeconds,
+				c.ClientIP(), c.Request.UserAgent(),
+			).Scan(&submissionID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal simpan jawaban: " + err.Error()})
+				return
+			}
+
+			// 5. Mark session submitted
+			_, _ = database.DB.Exec(`
+				UPDATE exam_live_sessions 
+				SET submitted_at = NOW() 
+				WHERE id = $1
+			`, sessionID)
+
+			// 6. Update schedule stats
+			_, _ = database.DB.Exec(`
+				UPDATE exam_schedules SET
+					total_submitted = (SELECT COUNT(*) FROM exam_submissions WHERE schedule_id = $1),
+					total_graded = (SELECT COUNT(*) FROM exam_submissions WHERE schedule_id = $1 AND status = 'graded'),
+					average_score = (SELECT AVG(percentage) FROM exam_submissions WHERE schedule_id = $1),
+					highest_score = (SELECT MAX(percentage) FROM exam_submissions WHERE schedule_id = $1),
+					lowest_score = (SELECT MIN(percentage) FROM exam_submissions WHERE schedule_id = $1),
+					updated_at = NOW()
+				WHERE id = $1
+			`, scheduleID)
+
+			c.JSON(http.StatusOK, gin.H{
+				"submission_id": submissionID,
+				"total_score":   totalScore,
+				"max_score":     maxScore,
+				"percentage":    percentage,
+				"is_passed":     percentage >= passingScore,
+				"message":       "Jawaban berhasil dikumpulkan. Soal essay akan dikoreksi manual oleh guru.",
+			})
+		})
 	}
 
 	// ==========================================
@@ -2207,7 +2690,7 @@ func SetupRoutes(r *gin.Engine) {
                 return
             }
 
-           loc, _ := time.LoadLocation("Asia/Jakarta")
+            loc, _ := time.LoadLocation("Asia/Jakarta")
             waktuUbah := time.Now().In(loc).Format("02 January 2006 pukul 15:04 WIB")
             ipClient := c.ClientIP()
 
@@ -2541,215 +3024,6 @@ func SetupRoutes(r *gin.Engine) {
 			c.JSON(http.StatusOK, gin.H{"question_banks": banks})
 		})
 
-		
-		api.POST("/exam-sessions", func(c *gin.Context) {
-			userID, exists := c.Get("user_id")
-			if !exists {
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-				return
-			}
-
-			var req CreateExamSessionRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Data sesi ujian tidak valid: " + err.Error()})
-				return
-			}
-
-			qrToken := randString(12)
-			expiresAt := time.Now().Add(time.Hour * 3)
-
-			durasi := req.DurationMinutes
-			if durasi <= 0 {
-				durasi = 60
-			}
-
-			var sessionID string
-			queryExec := `INSERT INTO exam_sessions (user_id, title, question_bank_id, qr_code_token, duration_minutes, expires_at) 
-			              VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`
-
-			err := database.DB.QueryRow(queryExec, userID, req.Title, req.QuestionBankID, qrToken, durasi, expiresAt).Scan(&sessionID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membuat sesi ujian di database: " + err.Error()})
-				return
-			}
-
-			c.JSON(http.StatusCreated, gin.H{
-				"message":          "Sesi ujian berhasil dibuat",
-				"session_id":       sessionID,
-				"qr_code_token":    qrToken,
-				"duration_minutes": durasi,
-			})
-		})
-
-	
-		api.GET("/exam-sessions", func(c *gin.Context) {
-			userID, exists := c.Get("user_id")
-			if !exists {
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-				return
-			}
-
-			rows, err := database.DB.Query(`
-				SELECT id, title, qr_code_token, duration_minutes, is_active, created_at 
-				FROM exam_sessions 
-				WHERE user_id = $1 AND deleted_at IS NULL
-				ORDER BY created_at DESC
-			`, userID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat daftar sesi ujian"})
-				return
-			}
-			defer rows.Close()
-
-			type SessionItem struct {
-				ID              string    `json:"id"`
-				Title           string    `json:"title"`
-				QRCodeToken     string    `json:"qr_code_token"`
-				DurationMinutes int       `json:"duration_minutes"`
-				IsActive        bool      `json:"is_active"`
-				CreatedAt       time.Time `json:"created_at"`
-			}
-
-			var sessions []SessionItem
-			for rows.Next() {
-				var s SessionItem
-				if err := rows.Scan(&s.ID, &s.Title, &s.QRCodeToken, &s.DurationMinutes, &s.IsActive, &s.CreatedAt); err == nil {
-					sessions = append(sessions, s)
-				}
-			}
-
-			c.JSON(http.StatusOK, gin.H{"sessions": sessions})
-		})
-
-		
-		api.GET("/exam-sessions/:id/submissions", func(c *gin.Context) {
-			userID, _ := c.Get("user_id")
-			sessionID := c.Param("id")
-
-			// Pastikan sesi ini benar milik guru yang bersangkutan
-			var ownerID string
-			err := database.DB.QueryRow(`SELECT user_id FROM exam_sessions WHERE id = $1`, sessionID).Scan(&ownerID)
-			if err != nil || ownerID != userID {
-				c.JSON(http.StatusForbidden, gin.H{"error": "Akses ditolak! Sesi ujian bukan milik Anda."})
-				return
-			}
-
-			rows, err := database.DB.Query(`
-				SELECT id, student_name, student_number, nisn, score, submitted_at 
-				FROM exam_submissions 
-				WHERE exam_session_id = $1 
-				ORDER BY submitted_at DESC
-			`, sessionID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat data log monitoring"})
-				return
-			}
-			defer rows.Close()
-
-			type SubmissionItem struct {
-				ID            string    `json:"id"`
-				StudentName   string    `json:"student_name"`
-				StudentNumber string    `json:"student_number"`
-				NISN          string    `json:"nisn"`
-				Score         float64   `json:"score"`
-				SubmittedAt   time.Time `json:"submitted_at"`
-			}
-
-			submissions := make([]SubmissionItem, 0)
-			for rows.Next() {
-				var s SubmissionItem
-				if err := rows.Scan(&s.ID, &s.StudentName, &s.StudentNumber, &s.NISN, &s.Score, &s.SubmittedAt); err == nil {
-					submissions = append(submissions, s)
-				}
-			}
-
-			c.JSON(http.StatusOK, gin.H{"submissions": submissions})
-		})
-
-	
-		api.DELETE("/exam-sessions/:id", func(c *gin.Context) {
-			userID, _ := c.Get("user_id")
-			sessionID := c.Param("id")
-
-			result, err := database.DB.Exec(`
-				UPDATE exam_sessions SET deleted_at = NOW(), is_active = FALSE WHERE id = $1 AND user_id = $2
-			`, sessionID, userID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menghapus sesi ujian"})
-				return
-			}
-
-			rowsAffected, _ := result.RowsAffected()
-			if rowsAffected == 0 {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak ditemukan atau bukan milik Anda"})
-				return
-			}
-
-			c.JSON(http.StatusOK, gin.H{"message": "Sesi ujian berhasil dipindahkan ke tempat sampah (Trash Bin)"})
-		})
-
-	
-		api.GET("/exam-sessions/trash", func(c *gin.Context) {
-			userID, _ := c.Get("user_id")
-
-			rows, err := database.DB.Query(`
-				SELECT id, title, qr_code_token, duration_minutes, is_active, created_at, deleted_at 
-				FROM exam_sessions 
-				WHERE user_id = $1 AND deleted_at IS NOT NULL
-				ORDER BY deleted_at DESC
-			`, userID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat data tempat sampah"})
-				return
-			}
-			defer rows.Close()
-
-			type TrashItem struct {
-				ID              string     `json:"id"`
-				Title           string     `json:"title"`
-				QRCodeToken     string     `json:"qr_code_token"`
-				DurationMinutes int        `json:"duration_minutes"`
-				IsActive        bool       `json:"is_active"`
-				CreatedAt       time.Time  `json:"created_at"`
-				DeletedAt       *time.Time `json:"deleted_at"`
-			}
-
-			trashes := make([]TrashItem, 0)
-			for rows.Next() {
-				var t TrashItem
-				var deletedAt sql.NullTime
-				if err := rows.Scan(&t.ID, &t.Title, &t.QRCodeToken, &t.DurationMinutes, &t.IsActive, &t.CreatedAt, &deletedAt); err == nil {
-					if deletedAt.Valid {
-						t.DeletedAt = &deletedAt.Time
-					}
-					trashes = append(trashes, t)
-				}
-			}
-
-			c.JSON(http.StatusOK, gin.H{"trash_sessions": trashes})
-		})
-
-		
-		api.POST("/exam-sessions/:id/restore", func(c *gin.Context) {
-			userID, _ := c.Get("user_id")
-			sessionID := c.Param("id")
-
-			result, err := database.DB.Exec(`
-				UPDATE exam_sessions SET deleted_at = NULL, is_active = TRUE WHERE id = $1 AND user_id = $2
-			`, sessionID, userID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memulihkan sesi ujian"})
-				return
-			}
-
-			rowsAffected, _ := result.RowsAffected()
-			if rowsAffected == 0 {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak ditemukan di tempat sampah"})
-				return
-			}
-
-			c.JSON(http.StatusOK, gin.H{"message": "Sesi ujian berhasil dipulihkan"})
-		})
 
 		api.POST("/ai/generate-questions", func(c *gin.Context) {
 			var req GenerateAIRequest
@@ -6135,7 +6409,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
-				// ==========================================
+		// ==========================================
 		// SCHOOL ADMIN: List semua guru di sekolah
 		// ==========================================
 		api.GET("/school-admin/teachers", func(c *gin.Context) {
@@ -6431,6 +6705,1630 @@ func SetupRoutes(r *gin.Engine) {
 			}
 
 			c.JSON(http.StatusOK, gin.H{"message": "Guru berhasil di-remove dari sekolah"})
+		})
+
+		// ==========================================
+		// SCHOOL ADMIN: SCHOOL EXAMS (CRUD)
+		// ==========================================
+
+		// -------------------- LIST --------------------
+		// GET /api/school-admin/exams?status=draft&subject=Matematika&search=uts
+		api.GET("/school-admin/exams", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			status := c.Query("status")
+			subject := c.Query("subject")
+			search := c.Query("search")
+			examType := c.Query("exam_type")
+
+			query := `
+				SELECT 
+					e.id, e.title, COALESCE(e.description, ''), e.subject, e.exam_type,
+					COALESCE(e.grade_level, ''), COALESCE(e.phase, ''),
+					e.duration_minutes, e.total_questions, e.total_score, 
+					COALESCE(e.passing_score, 0),
+					e.status, e.is_active,
+					e.created_at, e.updated_at, e.published_at,
+					COALESCE(say.name, '') AS academic_year_name,
+					COALESCE(say.semester, '') AS semester,
+					COALESCE(
+						(SELECT json_agg(json_build_object(
+							'id', et.id,
+							'class_group_id', et.class_group_id,
+							'class_sub_group_id', et.class_sub_group_id,
+							'class_group_name', cg.name,
+							'class_sub_group_name', csg.name
+						))
+						FROM exam_targets et
+						LEFT JOIN class_groups cg ON et.class_group_id = cg.id
+						LEFT JOIN class_sub_groups csg ON et.class_sub_group_id = csg.id
+						WHERE et.exam_id = e.id),
+						'[]'::json
+					) AS targets
+				FROM school_exams e
+				LEFT JOIN school_academic_years say ON e.academic_year_id = say.id
+				WHERE e.school_id = $1 AND e.deleted_at IS NULL
+			`
+			args := []any{schoolID}
+			argIdx := 2
+
+			if status != "" {
+				query += fmt.Sprintf(" AND e.status = $%d", argIdx)
+				args = append(args, status)
+				argIdx++
+			}
+			if subject != "" {
+				query += fmt.Sprintf(" AND e.subject = $%d", argIdx)
+				args = append(args, subject)
+				argIdx++
+			}
+			if examType != "" {
+				query += fmt.Sprintf(" AND e.exam_type = $%d", argIdx)
+				args = append(args, examType)
+				argIdx++
+			}
+			if search != "" {
+				query += fmt.Sprintf(" AND (e.title ILIKE $%d OR e.description ILIKE $%d)", argIdx, argIdx)
+				args = append(args, "%"+search+"%")
+				argIdx++
+			}
+
+			query += " ORDER BY e.created_at DESC"
+
+			rows, err := database.DB.Query(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat daftar ujian: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type ExamListItem struct {
+				ID                string          `json:"id"`
+				Title             string          `json:"title"`
+				Description       string          `json:"description"`
+				Subject           string          `json:"subject"`
+				ExamType          string          `json:"exam_type"`
+				GradeLevel        string          `json:"grade_level"`
+				Phase             string          `json:"phase"`
+				DurationMinutes   int             `json:"duration_minutes"`
+				TotalQuestions    int             `json:"total_questions"`
+				TotalScore        float64         `json:"total_score"`
+				PassingScore      float64         `json:"passing_score"`
+				Status            string          `json:"status"`
+				IsActive          bool            `json:"is_active"`
+				CreatedAt         time.Time       `json:"created_at"`
+				UpdatedAt         time.Time       `json:"updated_at"`
+				PublishedAt       *time.Time      `json:"published_at"`
+				AcademicYearName  string          `json:"academic_year_name"`
+				Semester          string          `json:"semester"`
+				Targets           json.RawMessage `json:"targets"`
+			}
+
+			var exams []ExamListItem
+			for rows.Next() {
+				var e ExamListItem
+				var desc, gradeLevel, phase, ayName, semester sql.NullString
+				var passingScore sql.NullFloat64
+				var publishedAt sql.NullTime
+				var targetsJSON []byte
+
+				err := rows.Scan(
+					&e.ID, &e.Title, &desc, &e.Subject, &e.ExamType,
+					&gradeLevel, &phase,
+					&e.DurationMinutes, &e.TotalQuestions, &e.TotalScore, &passingScore,
+					&e.Status, &e.IsActive,
+					&e.CreatedAt, &e.UpdatedAt, &publishedAt,
+					&ayName, &semester, &targetsJSON,
+				)
+				if err != nil {
+					continue
+				}
+
+				e.Description = desc.String
+				e.GradeLevel = gradeLevel.String
+				e.Phase = phase.String
+				e.AcademicYearName = ayName.String
+				e.Semester = semester.String
+				if passingScore.Valid {
+					e.PassingScore = passingScore.Float64
+				}
+				if publishedAt.Valid {
+					e.PublishedAt = &publishedAt.Time
+				}
+				e.Targets = json.RawMessage(targetsJSON)
+
+				exams = append(exams, e)
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"total": len(exams),
+				"exams": exams,
+			})
+		})
+
+		// -------------------- DETAIL --------------------
+		// GET /api/school-admin/exams/:id
+		api.GET("/school-admin/exams/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			examID := c.Param("id")
+
+			var e struct {
+				ID                string
+				Title             string
+				Description       sql.NullString
+				Subject           string
+				ExamType          string
+				GradeLevel        sql.NullString
+				Phase             sql.NullString
+				AcademicYearID    sql.NullString
+				DurationMinutes   int
+				TotalQuestions    int
+				TotalScore        float64
+				PassingScore      sql.NullFloat64
+				AutoGradeMC       bool
+				ManualGradeEssay  bool
+				Status            string
+				IsActive          bool
+				CreatedAt         time.Time
+				UpdatedAt         time.Time
+				PublishedAt       sql.NullTime
+				Questions         []byte
+				ScoringConfig     []byte
+				AcademicYearName  sql.NullString
+				Semester          sql.NullString
+			}
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					e.id, e.title, e.description, e.subject, e.exam_type,
+					e.grade_level, e.phase, e.academic_year_id,
+					e.duration_minutes, e.total_questions, e.total_score, e.passing_score,
+					e.auto_grade_mc, e.manual_grade_essay,
+					e.status, e.is_active,
+					e.created_at, e.updated_at, e.published_at,
+					e.questions, e.scoring_config,
+					say.name, say.semester
+				FROM school_exams e
+				LEFT JOIN school_academic_years say ON e.academic_year_id = say.id
+				WHERE e.id = $1 AND e.school_id = $2 AND e.deleted_at IS NULL
+			`, examID, schoolID).Scan(
+				&e.ID, &e.Title, &e.Description, &e.Subject, &e.ExamType,
+				&e.GradeLevel, &e.Phase, &e.AcademicYearID,
+				&e.DurationMinutes, &e.TotalQuestions, &e.TotalScore, &e.PassingScore,
+				&e.AutoGradeMC, &e.ManualGradeEssay,
+				&e.Status, &e.IsActive,
+				&e.CreatedAt, &e.UpdatedAt, &e.PublishedAt,
+				&e.Questions, &e.ScoringConfig,
+				&e.AcademicYearName, &e.Semester,
+			)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Ujian tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			// Ambil targets
+			targetRows, err := database.DB.Query(`
+				SELECT 
+					et.id, et.class_group_id, et.class_sub_group_id,
+					COALESCE(cg.name, '') AS class_group_name,
+					COALESCE(csg.name, '') AS class_sub_group_name,
+					COALESCE(cg.level, '') AS class_level
+				FROM exam_targets et
+				LEFT JOIN class_groups cg ON et.class_group_id = cg.id
+				LEFT JOIN class_sub_groups csg ON et.class_sub_group_id = csg.id
+				WHERE et.exam_id = $1
+			`, examID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			defer targetRows.Close()
+
+			type TargetItem struct {
+				ID                 string  `json:"id"`
+				ClassGroupID       *string `json:"class_group_id"`
+				ClassSubGroupID    *string `json:"class_sub_group_id"`
+				ClassGroupName     string  `json:"class_group_name"`
+				ClassSubGroupName  string  `json:"class_sub_group_name"`
+				ClassLevel         string  `json:"class_level"`
+			}
+
+			var targets []TargetItem
+			for targetRows.Next() {
+				var t TargetItem
+				var cgID, csgID sql.NullString
+				if err := targetRows.Scan(&t.ID, &cgID, &csgID, &t.ClassGroupName, &t.ClassSubGroupName, &t.ClassLevel); err == nil {
+					if cgID.Valid { t.ClassGroupID = &cgID.String }
+					if csgID.Valid { t.ClassSubGroupID = &csgID.String }
+					targets = append(targets, t)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"exam": gin.H{
+					"id":                 e.ID,
+					"title":              e.Title,
+					"description":        e.Description.String,
+					"subject":            e.Subject,
+					"exam_type":          e.ExamType,
+					"grade_level":        e.GradeLevel.String,
+					"phase":              e.Phase.String,
+					"academic_year_id":   e.AcademicYearID.String,
+					"academic_year_name": e.AcademicYearName.String,
+					"semester":           e.Semester.String,
+					"duration_minutes":   e.DurationMinutes,
+					"total_questions":    e.TotalQuestions,
+					"total_score":        e.TotalScore,
+					"passing_score":      e.PassingScore.Float64,
+					"auto_grade_mc":      e.AutoGradeMC,
+					"manual_grade_essay": e.ManualGradeEssay,
+					"status":             e.Status,
+					"is_active":          e.IsActive,
+					"created_at":         e.CreatedAt,
+					"updated_at":         e.UpdatedAt,
+					"published_at":       e.PublishedAt.Time,
+					"questions":          json.RawMessage(e.Questions),
+					"scoring_config":     json.RawMessage(e.ScoringConfig),
+					"targets":            targets,
+				},
+			})
+		})
+
+		// -------------------- CREATE --------------------
+		// POST /api/school-admin/exams
+		api.POST("/school-admin/exams", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			var req CreateSchoolExamRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// Validasi: harus ada minimal 1 target
+			if len(req.Targets) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Minimal pilih 1 kelas/sub kelas target"})
+				return
+			}
+
+			// Hitung total score dari semua questions
+			var totalScore float64
+			for _, q := range req.Questions {
+				totalScore += q.Score
+			}
+			if totalScore == 0 {
+				totalScore = 100 // fallback
+			}
+
+			examType := req.ExamType
+			if examType == "" { examType = "regular" }
+
+			scoringConfig := req.ScoringConfig
+			if len(scoringConfig) == 0 {
+				scoringConfig = json.RawMessage(`{"multiple_choice":1,"essay":5,"essay_rubric":"manual"}`)
+			}
+
+			questionsJSON, _ := json.Marshal(req.Questions)
+
+			// Mulai transaksi
+			tx, err := database.DB.Begin()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mulai transaksi"})
+				return
+			}
+			defer tx.Rollback()
+
+			// 1. Insert exam header
+			var examID string
+			err = tx.QueryRow(`
+				INSERT INTO school_exams (
+					school_id, academic_year_id, created_by,
+					title, description, subject, exam_type, grade_level, phase,
+					duration_minutes, total_questions, total_score, passing_score,
+					scoring_config, questions, status
+				) VALUES (
+					$1, NULLIF($2,'')::uuid, $3,
+					$4, NULLIF($5,''), $6, $7, NULLIF($8,''), NULLIF($9,''),
+					$10, $11, $12, $13,
+					$14::jsonb, $15::jsonb, 'draft'
+				) RETURNING id
+			`, schoolID, req.AcademicYearID, adminID,
+				req.Title, req.Description, req.Subject, examType, req.GradeLevel, req.Phase,
+				req.DurationMinutes, len(req.Questions), totalScore, req.PassingScore,
+				scoringConfig, questionsJSON,
+			).Scan(&examID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan ujian: " + err.Error()})
+				return
+			}
+
+			// 2. Insert targets (validasi tiap sub kelas milik sekolah ini)
+			for _, t := range req.Targets {
+				// Kalau ada sub_group_id, validasi dulu
+				if t.ClassSubGroupID != "" {
+					var validSchoolID string
+					err := tx.QueryRow(`
+						SELECT school_id FROM class_sub_groups WHERE id = $1
+					`, t.ClassSubGroupID).Scan(&validSchoolID)
+					if err != nil || validSchoolID != schoolID {
+						c.JSON(http.StatusBadRequest, gin.H{
+							"error": fmt.Sprintf("Sub kelas %s tidak valid / bukan milik sekolah Anda", t.ClassSubGroupID),
+						})
+						return
+					}
+				}
+
+				_, err = tx.Exec(`
+					INSERT INTO exam_targets (exam_id, class_group_id, class_sub_group_id)
+					VALUES ($1, NULLIF($2,'')::uuid, NULLIF($3,'')::uuid)
+					ON CONFLICT (exam_id, class_sub_group_id) DO NOTHING
+				`, examID, t.ClassGroupID, t.ClassSubGroupID)
+
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan target: " + err.Error()})
+					return
+				}
+			}
+
+			if err := tx.Commit(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal commit"})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message": "Ujian berhasil dibuat (draft)",
+				"id":      examID,
+			})
+		})
+
+		// -------------------- UPDATE --------------------
+		// PUT /api/school-admin/exams/:id
+		// Hanya bisa update kalau status = 'draft'
+		api.PUT("/school-admin/exams/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			examID := c.Param("id")
+
+			// Cek status dulu
+			var currentStatus string
+			err = database.DB.QueryRow(`
+				SELECT status FROM school_exams 
+				WHERE id = $1 AND school_id = $2 AND deleted_at IS NULL
+			`, examID, schoolID).Scan(&currentStatus)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Ujian tidak ditemukan"})
+				return
+			}
+
+			if currentStatus != "draft" {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": "Hanya ujian berstatus draft yang bisa diubah. Arsipkan atau buat baru.",
+				})
+				return
+			}
+
+			var req CreateSchoolExamRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			var totalScore float64
+			for _, q := range req.Questions {
+				totalScore += q.Score
+			}
+			if totalScore == 0 { totalScore = 100 }
+
+			examType := req.ExamType
+			if examType == "" { examType = "regular" }
+
+			scoringConfig := req.ScoringConfig
+			if len(scoringConfig) == 0 {
+				scoringConfig = json.RawMessage(`{"multiple_choice":1,"essay":5,"essay_rubric":"manual"}`)
+			}
+
+			questionsJSON, _ := json.Marshal(req.Questions)
+
+			tx, err := database.DB.Begin()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mulai transaksi"})
+				return
+			}
+			defer tx.Rollback()
+
+			// 1. Update header
+			_, err = tx.Exec(`
+				UPDATE school_exams SET
+					academic_year_id = NULLIF($1,'')::uuid,
+					title = $2,
+					description = NULLIF($3,''),
+					subject = $4,
+					exam_type = $5,
+					grade_level = NULLIF($6,''),
+					phase = NULLIF($7,''),
+					duration_minutes = $8,
+					total_questions = $9,
+					total_score = $10,
+					passing_score = $11,
+					scoring_config = $12::jsonb,
+					questions = $13::jsonb,
+					updated_at = NOW()
+				WHERE id = $14 AND school_id = $15
+			`, req.AcademicYearID, req.Title, req.Description, req.Subject, examType,
+				req.GradeLevel, req.Phase,
+				req.DurationMinutes, len(req.Questions), totalScore, req.PassingScore,
+				scoringConfig, questionsJSON,
+				examID, schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal update ujian: " + err.Error()})
+				return
+			}
+
+			// 2. Hapus targets lama, insert ulang
+			_, _ = tx.Exec(`DELETE FROM exam_targets WHERE exam_id = $1`, examID)
+
+			for _, t := range req.Targets {
+				if t.ClassSubGroupID != "" {
+					var validSchoolID string
+					err := tx.QueryRow(`
+						SELECT school_id FROM class_sub_groups WHERE id = $1
+					`, t.ClassSubGroupID).Scan(&validSchoolID)
+					if err != nil || validSchoolID != schoolID {
+						c.JSON(http.StatusBadRequest, gin.H{
+							"error": fmt.Sprintf("Sub kelas %s tidak valid", t.ClassSubGroupID),
+						})
+						return
+					}
+				}
+
+				_, err = tx.Exec(`
+					INSERT INTO exam_targets (exam_id, class_group_id, class_sub_group_id)
+					VALUES ($1, NULLIF($2,'')::uuid, NULLIF($3,'')::uuid)
+					ON CONFLICT (exam_id, class_sub_group_id) DO NOTHING
+				`, examID, t.ClassGroupID, t.ClassSubGroupID)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal update target: " + err.Error()})
+					return
+				}
+			}
+
+			if err := tx.Commit(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal commit"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Ujian berhasil diperbarui"})
+		})
+
+		// -------------------- PUBLISH --------------------
+		// PATCH /api/school-admin/exams/:id/publish
+		api.PATCH("/school-admin/exams/:id/publish", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			examID := c.Param("id")
+
+			// Validasi: minimal ada 1 soal & 1 target
+			var totalQ int
+			var targetCount int
+			err = database.DB.QueryRow(`
+				SELECT total_questions FROM school_exams 
+				WHERE id = $1 AND school_id = $2 AND deleted_at IS NULL
+			`, examID, schoolID).Scan(&totalQ)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Ujian tidak ditemukan"})
+				return
+			}
+
+			_ = database.DB.QueryRow(`SELECT COUNT(*) FROM exam_targets WHERE exam_id = $1`, examID).Scan(&targetCount)
+
+			if totalQ == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Tidak bisa publish: ujian belum punya soal"})
+				return
+			}
+			if targetCount == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Tidak bisa publish: belum ada target kelas"})
+				return
+			}
+
+			result, err := database.DB.Exec(`
+				UPDATE school_exams 
+				SET status = 'published', published_at = NOW(), updated_at = NOW()
+				WHERE id = $1 AND school_id = $2 AND status = 'draft'
+			`, examID, schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusConflict, gin.H{"error": "Ujian sudah dipublish atau status tidak valid"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Ujian berhasil dipublikasikan"})
+		})
+
+		// -------------------- ARCHIVE --------------------
+		// PATCH /api/school-admin/exams/:id/archive
+		api.PATCH("/school-admin/exams/:id/archive", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			result, err := database.DB.Exec(`
+				UPDATE school_exams 
+				SET status = 'archived', updated_at = NOW()
+				WHERE id = $1 AND school_id = $2 AND status IN ('draft', 'published')
+			`, c.Param("id"), schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Ujian tidak ditemukan atau tidak bisa diarsipkan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Ujian berhasil diarsipkan"})
+		})
+
+		// -------------------- DELETE (soft) --------------------
+		// DELETE /api/school-admin/exams/:id
+		api.DELETE("/school-admin/exams/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			result, err := database.DB.Exec(`
+				UPDATE school_exams 
+				SET deleted_at = NOW(), updated_at = NOW()
+				WHERE id = $1 AND school_id = $2 AND deleted_at IS NULL
+			`, c.Param("id"), schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Ujian tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Ujian berhasil dihapus"})
+		})
+
+		// -------------------- HELPER: DAFTAR KELAS UNTUK DROPDOWN --------------------
+		// GET /api/school-admin/exams/target-options
+		// Return semua class_group + sub_group milik sekolah (untuk dropdown saat buat ujian)
+		api.GET("/school-admin/exams/target-options", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT 
+					cg.id AS class_group_id,
+					cg.name AS class_group_name,
+					cg.level,
+					COALESCE(cg.class_type, 'Umum') AS class_type,
+					say.id AS academic_year_id,
+					COALESCE(say.name, '-') AS academic_year_name,
+					COALESCE(say.semester, '-') AS semester,
+					COALESCE(
+						(SELECT json_agg(json_build_object(
+							'id', csg.id,
+							'name', csg.name,
+							'code', csg.code,
+							'capacity', csg.capacity
+						))
+						FROM class_sub_groups csg
+						WHERE csg.class_group_id = cg.id AND csg.is_active = TRUE),
+						'[]'::json
+					) AS sub_classes
+				FROM class_groups cg
+				LEFT JOIN school_academic_years say ON cg.academic_year_id = say.id
+				WHERE cg.school_id = $1
+				ORDER BY cg.level ASC, cg.name ASC
+			`, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type ClassOption struct {
+				ClassGroupID     string          `json:"class_group_id"`
+				ClassGroupName   string          `json:"class_group_name"`
+				Level            string          `json:"level"`
+				ClassType        string          `json:"class_type"`
+				AcademicYearID   string          `json:"academic_year_id"`
+				AcademicYearName string          `json:"academic_year_name"`
+				Semester         string          `json:"semester"`
+				SubClasses       json.RawMessage `json:"sub_classes"`
+			}
+
+			var list []ClassOption
+			for rows.Next() {
+				var co ClassOption
+				var level, classType, ayID, ayName, semester sql.NullString
+				var subClassesJSON []byte
+
+				err := rows.Scan(
+					&co.ClassGroupID, &co.ClassGroupName, &level, &classType,
+					&ayID, &ayName, &semester, &subClassesJSON,
+				)
+				if err != nil {
+					continue
+				}
+				co.Level = level.String
+				co.ClassType = classType.String
+				co.AcademicYearID = ayID.String
+				co.AcademicYearName = ayName.String
+				co.Semester = semester.String
+				co.SubClasses = json.RawMessage(subClassesJSON)
+
+				list = append(list, co)
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"total": len(list),
+				"classes": list,
+			})
+		})
+
+		// GET /api/school-admin/exam-schedules?filter=upcoming&search=xxx
+		api.GET("/school-admin/exam-schedules", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			filter := c.Query("filter")   // all | today | week | upcoming | past
+			search := c.Query("search")
+
+			query := `
+				SELECT 
+					es.id, es.exam_id,
+					e.title AS exam_title, e.subject, es.duration_minutes,
+					es.schedule_date, es.start_time, es.end_time,
+					es.room, es.supervisor_name, es.access_code, es.status,
+					cg.name AS class_group_name,
+					csg.name AS class_sub_group_name,
+					es.total_students, es.total_submitted, es.total_graded,
+					es.average_score, es.highest_score, es.lowest_score
+				FROM exam_schedules es
+				JOIN school_exams e ON es.exam_id = e.id
+				LEFT JOIN class_groups cg ON es.class_group_id = cg.id
+				LEFT JOIN class_sub_groups csg ON es.class_sub_group_id = csg.id
+				WHERE es.school_id = $1 AND es.deleted_at IS NULL
+			`
+			args := []any{schoolID}
+			argIdx := 2
+
+			switch filter {
+			case "today":
+				query += " AND es.schedule_date = CURRENT_DATE"
+			case "week":
+				query += " AND es.schedule_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'"
+			case "upcoming":
+				query += " AND es.schedule_date >= CURRENT_DATE"
+			case "past":
+				query += " AND es.schedule_date < CURRENT_DATE"
+			}
+
+			if search != "" {
+				query += fmt.Sprintf(
+					" AND (e.title ILIKE $%d OR es.room ILIKE $%d OR es.supervisor_name ILIKE $%d)",
+					argIdx, argIdx, argIdx,
+				)
+				args = append(args, "%"+search+"%")
+				argIdx++
+			}
+
+			query += " ORDER BY es.schedule_date ASC, es.start_time ASC"
+
+			rows, err := database.DB.Query(query, args...)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat jadwal: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type ScheduleItem struct {
+				ID                 string          `json:"id"`
+				ExamID             string          `json:"exam_id"`
+				ExamTitle          string          `json:"exam_title"`
+				Subject            string          `json:"subject"`
+				DurationMinutes    int             `json:"duration_minutes"`
+				ScheduleDate       string          `json:"schedule_date"`
+				StartTime          string          `json:"start_time"`
+				EndTime            string          `json:"end_time"`
+				Room               *string         `json:"room"`
+				SupervisorName     *string         `json:"supervisor_name"`
+				AccessCode         *string         `json:"access_code"`
+				Status             string          `json:"status"`
+				ClassGroupName     *string         `json:"class_group_name"`
+				ClassSubGroupName  *string         `json:"class_sub_group_name"`
+				TotalStudents      int             `json:"total_students"`
+				TotalSubmitted     int             `json:"total_submitted"`
+				TotalGraded        int             `json:"total_graded"`
+				AverageScore       *float64        `json:"average_score"`
+				HighestScore       *float64        `json:"highest_score"`
+				LowestScore        *float64        `json:"lowest_score"`
+			}
+
+			var schedules []ScheduleItem
+			for rows.Next() {
+				var s ScheduleItem
+				var scheduleDate time.Time
+				var startTime, endTime time.Time
+				var room, supervisorName, accessCode sql.NullString
+				var classGroupName, classSubGroupName sql.NullString
+				var avgScore, highScore, lowScore sql.NullFloat64
+
+				err := rows.Scan(
+					&s.ID, &s.ExamID,
+					&s.ExamTitle, &s.Subject, &s.DurationMinutes,
+					&scheduleDate, &startTime, &endTime,
+					&room, &supervisorName, &accessCode, &s.Status,
+					&classGroupName, &classSubGroupName,
+					&s.TotalStudents, &s.TotalSubmitted, &s.TotalGraded,
+					&avgScore, &highScore, &lowScore,
+				)
+				if err != nil {
+					fmt.Printf("[GET SCHEDULES] Scan error: %v\n", err)
+					continue
+				}
+
+				s.ScheduleDate = scheduleDate.Format("2006-01-02")
+				s.StartTime = startTime.Format("15:04")
+				s.EndTime = endTime.Format("15:04")
+
+				if room.Valid { s.Room = &room.String }
+				if supervisorName.Valid { s.SupervisorName = &supervisorName.String }
+				if accessCode.Valid { s.AccessCode = &accessCode.String }
+				if classGroupName.Valid { s.ClassGroupName = &classGroupName.String }
+				if classSubGroupName.Valid { s.ClassSubGroupName = &classSubGroupName.String }
+				if avgScore.Valid { s.AverageScore = &avgScore.Float64 }
+				if highScore.Valid { s.HighestScore = &highScore.Float64 }
+				if lowScore.Valid { s.LowestScore = &lowScore.Float64 }
+
+				schedules = append(schedules, s)
+			}
+
+			if schedules == nil {
+				schedules = []ScheduleItem{}
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"total":     len(schedules),
+				"schedules": schedules,
+			})
+		})
+
+		// GET /api/school-admin/exam-schedules/available-targets?exam_id=xxx
+		api.GET("/school-admin/exam-schedules/available-targets", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			examID := c.Query("exam_id")
+			if examID == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "exam_id wajib diisi"})
+				return
+			}
+
+			// Validasi exam milik sekolah ini & published
+			var examExists bool
+			err = database.DB.QueryRow(`
+				SELECT EXISTS(
+					SELECT 1 FROM school_exams 
+					WHERE id = $1 AND school_id = $2 
+					AND deleted_at IS NULL
+					AND status = 'published'
+				)
+			`, examID, schoolID).Scan(&examExists)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal validasi ujian: " + err.Error()})
+				return
+			}
+			if !examExists {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Ujian tidak ditemukan atau belum dipublish"})
+				return
+			}
+
+			rows, err := database.DB.Query(`
+				SELECT 
+					et.class_group_id,
+					COALESCE(cg.name, '') AS class_group_name,
+					et.class_sub_group_id,
+					COALESCE(csg.name, '') AS class_sub_group_name,
+					COALESCE(cg.level, '') AS class_level,
+					(
+						SELECT COUNT(*) FROM students s 
+						WHERE s.class_sub_group_id = et.class_sub_group_id 
+						AND s.is_active = TRUE
+					) AS student_count,
+					(
+						SELECT COUNT(*) FROM exam_schedules es
+						WHERE es.exam_id = et.exam_id
+						AND es.class_sub_group_id = et.class_sub_group_id
+						AND es.status IN ('scheduled', 'ongoing')
+						AND es.deleted_at IS NULL
+					) AS active_schedule_count
+				FROM exam_targets et
+				LEFT JOIN class_groups cg ON et.class_group_id = cg.id
+				LEFT JOIN class_sub_groups csg ON et.class_sub_group_id = csg.id
+				WHERE et.exam_id = $1 
+				AND et.class_sub_group_id IS NOT NULL
+				AND EXISTS (
+					SELECT 1 FROM class_groups 
+					WHERE id = et.class_group_id AND school_id = $2
+				)
+				ORDER BY cg.level ASC, cg.name ASC, csg.name ASC
+			`, examID, schoolID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memuat target: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type TargetItem struct {
+				ClassGroupID          string `json:"class_group_id"`
+				ClassGroupName        string `json:"class_group_name"`
+				ClassSubGroupID       string `json:"class_sub_group_id"`
+				ClassSubGroupName     string `json:"class_sub_group_name"`
+				ClassLevel            string `json:"class_level"`
+				StudentCount          int    `json:"student_count"`
+				ActiveScheduleCount   int    `json:"active_schedule_count"`
+				HasActiveSchedule     bool   `json:"has_active_schedule"`
+			}
+
+			targets := []TargetItem{}
+			for rows.Next() {
+				var t TargetItem
+				var classGroupID, classSubGroupID sql.NullString
+
+				err := rows.Scan(
+					&classGroupID,
+					&t.ClassGroupName,
+					&classSubGroupID,
+					&t.ClassSubGroupName,
+					&t.ClassLevel,
+					&t.StudentCount,
+					&t.ActiveScheduleCount,
+				)
+				if err != nil {
+					fmt.Printf("[AVAILABLE TARGETS] Scan error: %v\n", err)
+					continue
+				}
+
+				t.ClassGroupID = classGroupID.String
+				t.ClassSubGroupID = classSubGroupID.String
+				t.HasActiveSchedule = t.ActiveScheduleCount > 0
+
+				targets = append(targets, t)
+			}
+
+			if err := rows.Err(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error iterasi rows: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"exam_id": examID,
+				"total":   len(targets),
+				"targets": targets,
+			})
+		})
+
+		api.POST("/school-admin/exam-schedules", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			var req CreateScheduleRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// Validasi exam published & milik sekolah
+			var examStatus string
+			err = database.DB.QueryRow(`
+				SELECT status FROM school_exams 
+				WHERE id = $1 AND school_id = $2 AND deleted_at IS NULL
+			`, req.ExamID, schoolID).Scan(&examStatus)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Ujian tidak ditemukan"})
+				return
+			}
+			if examStatus != "published" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Hanya ujian published yang bisa dijadwalkan"})
+				return
+			}
+
+			// Cek access_code unik
+			var existingID string
+			err = database.DB.QueryRow(`
+				SELECT id FROM exam_schedules 
+				WHERE access_code = $1 AND deleted_at IS NULL
+			`, req.AccessCode).Scan(&existingID)
+			if err == nil && existingID != "" {
+				c.JSON(http.StatusConflict, gin.H{"error": "Kode akses sudah dipakai. Generate ulang."})
+				return
+			}
+
+			tx, err := database.DB.Begin()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mulai transaksi"})
+				return
+			}
+			defer tx.Rollback()
+
+			createdIDs := []string{}
+
+			// 1 jadwal per sub kelas — biar rapi di report
+			for _, subGroupID := range req.TargetSubGroupIDs {
+				// Validasi sub group milik sekolah
+				var validSchoolID string
+				var classGroupID string
+				err := tx.QueryRow(`
+					SELECT school_id, class_group_id FROM class_sub_groups WHERE id = $1
+				`, subGroupID).Scan(&validSchoolID, &classGroupID)
+				if err != nil || validSchoolID != schoolID {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Sub kelas tidak valid: " + subGroupID})
+					return
+				}
+
+				// Count students
+				var totalStudents int
+				_ = tx.QueryRow(`
+					SELECT COUNT(*) FROM students 
+					WHERE class_sub_group_id = $1 AND is_active = TRUE
+				`, subGroupID).Scan(&totalStudents)
+
+				var scheduleID string
+				err = tx.QueryRow(`
+					INSERT INTO exam_schedules (
+						school_id, exam_id,
+						class_group_id, class_sub_group_id,
+						schedule_date, start_time, end_time, duration_minutes,
+						room, supervisor_name, session_notes,
+						access_code, require_login,
+						status, total_students,
+						created_by
+					) VALUES (
+						$1, $2, $3, $4, $5, $6, $7, $8,
+						NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''),
+						$12, $13, 'scheduled', $14, $15
+					) RETURNING id
+				`, schoolID, req.ExamID,
+					classGroupID, subGroupID,
+					req.ScheduleDate, req.StartTime, req.EndTime, req.DurationMinutes,
+					req.Room, req.SupervisorName, req.SessionNotes,
+					req.AccessCode, req.RequireLogin,
+					totalStudents, adminID).Scan(&scheduleID)
+
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan jadwal: " + err.Error()})
+					return
+				}
+				createdIDs = append(createdIDs, scheduleID)
+			}
+
+			if err := tx.Commit(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal commit"})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"message":       fmt.Sprintf("%d jadwal berhasil dibuat", len(createdIDs)),
+				"schedule_ids":  createdIDs,
+				"access_code":   req.AccessCode,
+			})
+		})
+
+		api.GET("/school-admin/exam-schedules/:id/monitor", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			scheduleID := c.Param("id")
+
+			// 1. Ambil schedule info
+			var s struct {
+				ID                string
+				ExamID            string
+				ExamTitle         string
+				Subject           string
+				DurationMinutes   int
+				ScheduleDate      time.Time
+				StartTime         time.Time
+				EndTime           time.Time
+				Room              sql.NullString
+				SupervisorName    sql.NullString
+				AccessCode        sql.NullString
+				Status            string
+				ClassGroupName    sql.NullString
+				ClassSubGroupName sql.NullString
+				TotalStudents     int
+				TotalSubmitted    int
+				TotalGraded       int
+				AverageScore      sql.NullFloat64
+			}
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					es.id, es.exam_id,
+					e.title, e.subject, es.duration_minutes,
+					es.schedule_date, es.start_time, es.end_time,
+					es.room, es.supervisor_name, es.access_code, es.status,
+					cg.name, csg.name,
+					es.total_students, es.total_submitted, es.total_graded,
+					es.average_score
+				FROM exam_schedules es
+				JOIN school_exams e ON es.exam_id = e.id
+				LEFT JOIN class_groups cg ON es.class_group_id = cg.id
+				LEFT JOIN class_sub_groups csg ON es.class_sub_group_id = csg.id
+				WHERE es.id = $1 AND es.school_id = $2 AND es.deleted_at IS NULL
+			`, scheduleID, schoolID).Scan(
+				&s.ID, &s.ExamID,
+				&s.ExamTitle, &s.Subject, &s.DurationMinutes,
+				&s.ScheduleDate, &s.StartTime, &s.EndTime,
+				&s.Room, &s.SupervisorName, &s.AccessCode, &s.Status,
+				&s.ClassGroupName, &s.ClassSubGroupName,
+				&s.TotalStudents, &s.TotalSubmitted, &s.TotalGraded,
+				&s.AverageScore,
+			)
+
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Jadwal tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			// 2. Ambil semua siswa target + LEFT JOIN submissions
+			rows, err := database.DB.Query(`
+				SELECT 
+					s.id, s.full_name, COALESCE(s.nisn, ''), COALESCE(s.student_number, ''),
+					COALESCE(csg.name, ''),
+					sub.id, sub.status,
+					sub.started_at, sub.submitted_at, sub.last_activity_at,
+					sub.time_spent_seconds,
+					sub.total_score, sub.percentage, sub.is_passed,
+					COALESCE(sub.is_flagged, false),
+					COALESCE(sub.tab_switch_count, 0),
+					sub.ip_address
+				FROM students s
+				LEFT JOIN class_sub_groups csg ON s.class_sub_group_id = csg.id
+				LEFT JOIN exam_submissions sub 
+					ON sub.student_id = s.id AND sub.schedule_id = $1
+				WHERE s.school_id = $2 
+				AND s.class_sub_group_id = (SELECT class_sub_group_id FROM exam_schedules WHERE id = $1)
+				AND s.is_active = TRUE
+				ORDER BY s.full_name ASC
+			`, scheduleID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type StudentRow struct {
+				StudentID         string     `json:"student_id"`
+				StudentName       string     `json:"student_name"`
+				NISN              string     `json:"nisn"`
+				StudentNumber     string     `json:"student_number"`
+				ClassSubGroupName string     `json:"class_sub_group_name"`
+				SubmissionID      *string    `json:"submission_id"`
+				Status            string     `json:"status"`
+				StartedAt         *time.Time `json:"started_at"`
+				SubmittedAt       *time.Time `json:"submitted_at"`
+				LastActivityAt    *time.Time `json:"last_activity_at"`
+				TimeSpentSeconds  *int       `json:"time_spent_seconds"`
+				TotalScore        *float64   `json:"total_score"`
+				Percentage        *float64   `json:"percentage"`
+				IsPassed          *bool      `json:"is_passed"`
+				IsFlagged         bool       `json:"is_flagged"`
+				TabSwitchCount    int        `json:"tab_switch_count"`
+				IPAddress         *string    `json:"ip_address"`
+			}
+
+			students := []StudentRow{}
+			var inProgress, submitted, graded, notStarted, flagged int
+			var totalScoreSum float64
+			var scoreCount int
+
+			for rows.Next() {
+				var r StudentRow
+				var subID sql.NullString
+				var status sql.NullString
+				var startedAt, submittedAt, lastActivityAt sql.NullTime
+				var timeSpent sql.NullInt64
+				var totalScore, percentage sql.NullFloat64
+				var isPassed sql.NullBool
+				var ipAddress sql.NullString
+
+				err := rows.Scan(
+					&r.StudentID, &r.StudentName, &r.NISN, &r.StudentNumber,
+					&r.ClassSubGroupName,
+					&subID, &status,
+					&startedAt, &submittedAt, &lastActivityAt,
+					&timeSpent,
+					&totalScore, &percentage, &isPassed,
+					&r.IsFlagged, &r.TabSwitchCount,
+					&ipAddress,
+				)
+				if err != nil {
+					continue
+				}
+
+				if subID.Valid {
+					r.SubmissionID = &subID.String
+				}
+				if status.Valid {
+					r.Status = status.String
+				} else {
+					r.Status = "not_started"
+				}
+				if startedAt.Valid { r.StartedAt = &startedAt.Time }
+				if submittedAt.Valid { r.SubmittedAt = &submittedAt.Time }
+				if lastActivityAt.Valid { r.LastActivityAt = &lastActivityAt.Time }
+				if timeSpent.Valid {
+					t := int(timeSpent.Int64)
+					r.TimeSpentSeconds = &t
+				}
+				if totalScore.Valid { r.TotalScore = &totalScore.Float64 }
+				if percentage.Valid { r.Percentage = &percentage.Float64 }
+				if isPassed.Valid { r.IsPassed = &isPassed.Bool }
+				if ipAddress.Valid { r.IPAddress = &ipAddress.String }
+
+				// Aggregate stats
+				switch r.Status {
+				case "in_progress":
+					inProgress++
+				case "submitted":
+					submitted++
+				case "graded", "graded_with_pending":
+					graded++
+				case "not_started":
+					notStarted++
+				}
+				if r.IsFlagged {
+					flagged++
+				}
+				if r.Percentage != nil {
+					totalScoreSum += *r.Percentage
+					scoreCount++
+				}
+
+				students = append(students, r)
+			}
+
+			var avgScore *float64
+			if scoreCount > 0 {
+				avg := totalScoreSum / float64(scoreCount)
+				avgScore = &avg
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"schedule": gin.H{
+					"id":                   s.ID,
+					"exam_id":              s.ExamID,
+					"exam_title":           s.ExamTitle,
+					"subject":              s.Subject,
+					"duration_minutes":     s.DurationMinutes,
+					"schedule_date":        s.ScheduleDate.Format("2006-01-02"),
+					"start_time":           s.StartTime.Format("15:04"),
+					"end_time":             s.EndTime.Format("15:04"),
+					"room":                 s.Room.String,
+					"supervisor_name":      s.SupervisorName.String,
+					"access_code":          s.AccessCode.String,
+					"status":               s.Status,
+					"class_group_name":     s.ClassGroupName.String,
+					"class_sub_group_name": s.ClassSubGroupName.String,
+					"total_students":       s.TotalStudents,
+					"total_submitted":      s.TotalSubmitted,
+					"total_graded":         s.TotalGraded,
+					"average_score":        s.AverageScore.Float64,
+				},
+				"students": students,
+				"stats": gin.H{
+					"total_students": len(students),
+					"in_progress":    inProgress,
+					"submitted":      submitted,
+					"graded":         graded,
+					"not_started":    notStarted,
+					"flagged":        flagged,
+					"average_score":  avgScore,
+				},
+			})
+		})
+
+		api.PATCH("/school-admin/exam-schedules/:id/close", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			scheduleID := c.Param("id")
+
+			var currentStatus string
+			err = database.DB.QueryRow(`
+				SELECT status FROM exam_schedules 
+				WHERE id = $1 AND school_id = $2 AND deleted_at IS NULL
+			`, scheduleID, schoolID).Scan(&currentStatus)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Jadwal tidak ditemukan"})
+				return
+			}
+
+			if currentStatus == "completed" || currentStatus == "cancelled" {
+				c.JSON(http.StatusConflict, gin.H{"error": "Sesi sudah tidak aktif"})
+				return
+			}
+
+			// 1. Auto-submit semua submission yang masih in_progress
+			tx, err := database.DB.Begin()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mulai transaksi"})
+				return
+			}
+			defer tx.Rollback()
+
+			result, err := tx.Exec(`
+				UPDATE exam_submissions 
+				SET status = 'submitted', 
+					submitted_at = NOW(),
+					last_activity_at = NOW()
+				WHERE schedule_id = $1 AND status = 'in_progress'
+			`, scheduleID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			autoSubmitted, _ := result.RowsAffected()
+
+			// 2. Set schedule status = completed
+			_, err = tx.Exec(`
+				UPDATE exam_schedules 
+				SET status = 'completed', updated_at = NOW()
+				WHERE id = $1 AND school_id = $2
+			`, scheduleID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			if err := tx.Commit(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal commit"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":         "Sesi berhasil ditutup",
+				"auto_submitted":  autoSubmitted,
+			})
+		})
+
+		api.GET("/school-admin/exam-schedules/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			scheduleID := c.Param("id")
+
+			// 1. Ambil schedule + exam info
+			var s struct {
+				ID                string
+				ExamID            string
+				ExamTitle         string
+				ExamDescription   sql.NullString
+				Subject           string
+				ExamType          string
+				GradeLevel        sql.NullString
+				Phase             sql.NullString
+				TotalQuestions    int
+				TotalScore        float64
+				PassingScore      sql.NullFloat64
+				DurationMinutes   int
+
+				ScheduleDate      time.Time
+				StartTime         time.Time
+				EndTime           time.Time
+
+				Room              sql.NullString
+				SupervisorName    sql.NullString
+				SessionNotes      sql.NullString
+
+				AccessCode        sql.NullString
+				RequireLogin      bool
+
+				Status            string
+
+				ClassGroupID      sql.NullString
+				ClassGroupName    sql.NullString
+				ClassSubGroupID   sql.NullString
+				ClassSubGroupName sql.NullString
+
+				TotalStudents     int
+				TotalSubmitted    int
+				TotalGraded       int
+				AverageScore      sql.NullFloat64
+				HighestScore      sql.NullFloat64
+				LowestScore       sql.NullFloat64
+
+				CreatedAt         time.Time
+				UpdatedAt         time.Time
+			}
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					es.id, es.exam_id,
+					e.title, e.description, e.subject, e.exam_type,
+					e.grade_level, e.phase,
+					e.total_questions, e.total_score, e.passing_score,
+					es.duration_minutes,
+					es.schedule_date, es.start_time, es.end_time,
+					es.room, es.supervisor_name, es.session_notes,
+					es.access_code, es.require_login,
+					es.status,
+					es.class_group_id, cg.name,
+					es.class_sub_group_id, csg.name,
+					es.total_students, es.total_submitted, es.total_graded,
+					es.average_score, es.highest_score, es.lowest_score,
+					es.created_at, es.updated_at
+				FROM exam_schedules es
+				JOIN school_exams e ON es.exam_id = e.id
+				LEFT JOIN class_groups cg ON es.class_group_id = cg.id
+				LEFT JOIN class_sub_groups csg ON es.class_sub_group_id = csg.id
+				WHERE es.id = $1 AND es.school_id = $2 AND es.deleted_at IS NULL
+			`, scheduleID, schoolID).Scan(
+				&s.ID, &s.ExamID,
+				&s.ExamTitle, &s.ExamDescription, &s.Subject, &s.ExamType,
+				&s.GradeLevel, &s.Phase,
+				&s.TotalQuestions, &s.TotalScore, &s.PassingScore,
+				&s.DurationMinutes,
+				&s.ScheduleDate, &s.StartTime, &s.EndTime,
+				&s.Room, &s.SupervisorName, &s.SessionNotes,
+				&s.AccessCode, &s.RequireLogin,
+				&s.Status,
+				&s.ClassGroupID, &s.ClassGroupName,
+				&s.ClassSubGroupID, &s.ClassSubGroupName,
+				&s.TotalStudents, &s.TotalSubmitted, &s.TotalGraded,
+				&s.AverageScore, &s.HighestScore, &s.LowestScore,
+				&s.CreatedAt, &s.UpdatedAt,
+			)
+
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Jadwal tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			// 2. Ambil daftar peserta (semua siswa di class_sub_group ini)
+			type StudentParticipant struct {
+				StudentID      string   `json:"student_id"`
+				FullName       string   `json:"full_name"`
+				NISN           string   `json:"nisn"`
+				StudentNumber  string   `json:"student_number"`
+				SubmissionID   *string  `json:"submission_id"`
+				Status         string   `json:"status"`
+				TotalScore     *float64 `json:"total_score"`
+				Percentage     *float64 `json:"percentage"`
+				IsPassed       *bool    `json:"is_passed"`
+			}
+
+			students := []StudentParticipant{}
+
+			if s.ClassSubGroupID.Valid {
+				rows, err := database.DB.Query(`
+					SELECT 
+						s.id, s.full_name, COALESCE(s.nisn, ''), COALESCE(s.student_number, ''),
+						sub.id, sub.status,
+						sub.total_score, sub.percentage, sub.is_passed
+					FROM students s
+					LEFT JOIN exam_submissions sub 
+						ON sub.student_id = s.id AND sub.schedule_id = $1
+					WHERE s.class_sub_group_id = $2 
+					AND s.school_id = $3
+					AND s.is_active = TRUE
+					ORDER BY s.full_name ASC
+				`, scheduleID, s.ClassSubGroupID.String, schoolID)
+
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					return
+				}
+				defer rows.Close()
+
+				for rows.Next() {
+					var p StudentParticipant
+					var subID, subStatus sql.NullString
+					var totalScore, percentage sql.NullFloat64
+					var isPassed sql.NullBool
+
+					err := rows.Scan(
+						&p.StudentID, &p.FullName, &p.NISN, &p.StudentNumber,
+						&subID, &subStatus,
+						&totalScore, &percentage, &isPassed,
+					)
+					if err != nil {
+						continue
+					}
+
+					if subID.Valid {
+						p.SubmissionID = &subID.String
+					}
+					if subStatus.Valid {
+						p.Status = subStatus.String
+					} else {
+						p.Status = "not_started"
+					}
+					if totalScore.Valid { p.TotalScore = &totalScore.Float64 }
+					if percentage.Valid { p.Percentage = &percentage.Float64 }
+					if isPassed.Valid { p.IsPassed = &isPassed.Bool }
+
+					students = append(students, p)
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"schedule": gin.H{
+					"id":                   s.ID,
+					"exam_id":              s.ExamID,
+					"exam_title":           s.ExamTitle,
+					"exam_description":     s.ExamDescription.String,
+					"subject":              s.Subject,
+					"exam_type":            s.ExamType,
+					"grade_level":          s.GradeLevel.String,
+					"phase":                s.Phase.String,
+					"total_questions":      s.TotalQuestions,
+					"total_score":          s.TotalScore,
+					"passing_score":        s.PassingScore.Float64,
+					"duration_minutes":     s.DurationMinutes,
+					"schedule_date":        s.ScheduleDate.Format("2006-01-02"),
+					"start_time":           s.StartTime.Format("15:04"),
+					"end_time":             s.EndTime.Format("15:04"),
+					"room":                 s.Room.String,
+					"supervisor_name":      s.SupervisorName.String,
+					"session_notes":        s.SessionNotes.String,
+					"access_code":          s.AccessCode.String,
+					"require_login":        s.RequireLogin,
+					"status":               s.Status,
+					"class_group_id":       s.ClassGroupID.String,
+					"class_group_name":     s.ClassGroupName.String,
+					"class_sub_group_id":   s.ClassSubGroupID.String,
+					"class_sub_group_name": s.ClassSubGroupName.String,
+					"total_students":       s.TotalStudents,
+					"total_submitted":      s.TotalSubmitted,
+					"total_graded":         s.TotalGraded,
+					"average_score":        s.AverageScore.Float64,
+					"highest_score":        s.HighestScore.Float64,
+					"lowest_score":         s.LowestScore.Float64,
+					"created_at":           s.CreatedAt,
+					"updated_at":           s.UpdatedAt,
+				},
+				"students": students,
+			})
+		})
+
+		api.PATCH("/school-admin/exam-schedules/:id/cancel", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			scheduleID := c.Param("id")
+
+			result, err := database.DB.Exec(`
+				UPDATE exam_schedules 
+				SET status = 'cancelled', updated_at = NOW()
+				WHERE id = $1 AND school_id = $2 
+				AND status IN ('scheduled', 'ongoing')
+			`, scheduleID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{
+					"error": "Jadwal tidak ditemukan atau sudah selesai/dibatalkan",
+				})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Jadwal berhasil dibatalkan"})
+		})
+
+		api.DELETE("/school-admin/exam-schedules/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			scheduleID := c.Param("id")
+
+			result, err := database.DB.Exec(`
+				UPDATE exam_schedules 
+				SET deleted_at = NOW(), updated_at = NOW()
+				WHERE id = $1 AND school_id = $2 AND deleted_at IS NULL
+			`, scheduleID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			affected, _ := result.RowsAffected()
+			if affected == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Jadwal tidak ditemukan"})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{"message": "Jadwal berhasil dihapus"})
 		})
 
 	}
