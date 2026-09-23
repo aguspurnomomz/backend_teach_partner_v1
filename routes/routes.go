@@ -2141,7 +2141,7 @@ func SetupRoutes(r *gin.Engine) {
 			
 		})
 
-		api.POST("/auth/notify-password-changed", func(c *gin.Context) {
+		api.POST("/auth/notify-password-changedNotUssed", func(c *gin.Context) {
 			userID, exists := c.Get("user_id")
 			if !exists {
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
@@ -2184,6 +2184,55 @@ func SetupRoutes(r *gin.Engine) {
 
 			c.JSON(http.StatusOK, gin.H{"message": "Notifikasi perubahan kata sandi berhasil diproses"})
 		})
+
+		// ambil dari tabel auth supabasenya
+		api.POST("/auth/notify-password-changed", func(c *gin.Context) {
+            userID, exists := c.Get("user_id")
+            if !exists {
+                c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+                return
+            }
+
+            // Ambil email langsung dari tabel auth.users Supabase berdasarkan ID user
+            var userEmail string
+            err := database.DB.QueryRow(`SELECT COALESCE(email, '') FROM auth.users WHERE id = $1`, userID).Scan(&userEmail)
+            
+            // Fallback: Jika gagal di auth.users, coba cek ke tabel profiles
+            if err != nil || userEmail == "" {
+                _ = database.DB.QueryRow(`SELECT COALESCE(email_sekolah, '') FROM profiles WHERE id = $1`, userID).Scan(&userEmail)
+            }
+
+            if userEmail == "" {
+                c.JSON(http.StatusOK, gin.H{"message": "Kata sandi diperbarui, namun email pengguna tidak ditemukan"})
+                return
+            }
+
+            loc, _ := time.LoadLocation("Asia/Jakarta")
+            waktuUbah := time.Now().In(loc).Format("02 January 2006 pukul 15:04 WIB")
+            ipClient := c.ClientIP()
+
+            subjek := "Keamanan Akun: Kata Sandi Anda Telah Diubah"
+            
+            htmlBody := fmt.Sprintf(`
+                <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 10px;">
+                    <h2 style="color: #10b981;">TeachPartner Security Alert</h2>
+                    <p>Halo Guru,</p>
+                    <p>Kami ingin menginformasikan bahwa kata sandi untuk akun TeachPartner Anda baru saja berhasil diubah.</p>
+                    <div style="background-color: #f8fafc; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                        <p style="margin: 5px 0;"><strong>Waktu:</strong> %s</p>
+                        <p style="margin: 5px 0;"><strong>Alamat IP:</strong> %s</p>
+                    </div>
+                    <p>Jika Anda yang melakukan perubahan ini, Anda dapat mengabaikan email ini dengan aman.</p>
+                    <p style="color: #ef4444; font-weight: bold;">Jika Anda TIDAK merasa melakukan perubahan ini, segera hubungi administrator atau amankan akun Anda!</p>
+                    <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 20px 0;" />
+                    <p style="font-size: 12px; color: #64748b;">Email otomatis ini dikirimkan oleh sistem keamanan TeachPartner.</p>
+                </div>
+            `, waktuUbah, ipClient)
+
+            go sendResendEmail(userEmail, subjek, htmlBody)
+
+            c.JSON(http.StatusOK, gin.H{"message": "Notifikasi perubahan kata sandi berhasil diproses"})
+        })
 		
 		api.POST("/payment/create-snap", func(c *gin.Context) {
 			userID, _ := c.Get("user_id")
