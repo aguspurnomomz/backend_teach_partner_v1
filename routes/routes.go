@@ -2207,7 +2207,7 @@ func SetupRoutes(r *gin.Engine) {
                 return
             }
 
-            loc, _ := time.LoadLocation("Asia/Jakarta")
+           loc, _ := time.LoadLocation("Asia/Jakarta")
             waktuUbah := time.Now().In(loc).Format("02 January 2006 pukul 15:04 WIB")
             ipClient := c.ClientIP()
 
@@ -2215,17 +2215,19 @@ func SetupRoutes(r *gin.Engine) {
             
             htmlBody := fmt.Sprintf(`
                 <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 10px;">
-                    <h2 style="color: #10b981;">TeachPartner Security Alert</h2>
-                    <p>Halo Guru,</p>
-                    <p>Kami ingin menginformasikan bahwa kata sandi untuk akun TeachPartner Anda baru saja berhasil diubah.</p>
+                    <h2 style="color: #10b981;">SkoolaGo Security Alert</h2>
+                    <p>Halo Pengguna,</p>
+                    <p>Kami ingin menginformasikan bahwa kata sandi untuk akun Anda baru saja berhasil diubah.</p>
                     <div style="background-color: #f8fafc; padding: 15px; border-radius: 8px; margin: 20px 0;">
                         <p style="margin: 5px 0;"><strong>Waktu:</strong> %s</p>
                         <p style="margin: 5px 0;"><strong>Alamat IP:</strong> %s</p>
                     </div>
-                    <p>Jika Anda yang melakukan perubahan ini, Anda dapat mengabaikan email ini dengan aman.</p>
-                    <p style="color: #ef4444; font-weight: bold;">Jika Anda TIDAK merasa melakukan perubahan ini, segera hubungi administrator atau amankan akun Anda!</p>
+                    <p style="color: #ef4444; font-weight: bold;">Jika Anda merasa TIDAK melakukan perubahan ini, segera hubungi tim terkait melalui support@skoolago.com atau segera amankan akun Anda!</p>
                     <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 20px 0;" />
-                    <p style="font-size: 12px; color: #64748b;">Email otomatis ini dikirimkan oleh sistem keamanan TeachPartner.</p>
+                    <p style="font-size: 12px; color: #64748b; text-align: center;">
+                        &copy; 2026 SkoolaGo. All rights reserved.<br />
+                        Email otomatis ini dikirimkan oleh sistem keamanan SkoolaGo.
+                    </p>
                 </div>
             `, waktuUbah, ipClient)
 
