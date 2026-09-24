@@ -7807,7 +7807,6 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			// Untuk strict: validasi & auto-adjust durasi
 			if durationMode == "strict" {
 				startT, err1 := parseTimeString(req.StartTime)
 				endT, err2 := parseTimeString(req.EndTime)
@@ -7817,14 +7816,12 @@ func SetupRoutes(r *gin.Engine) {
 				}
 				diff := int(endT.Sub(startT).Minutes())
 				if diff <= 0 {
-					// Handle kalau lewat tengah malam (misal 23:00 → 01:00)
 					diff += 24 * 60
 				}
 				if diff <= 0 {
 					c.JSON(http.StatusBadRequest, gin.H{"error": "Jam selesai harus lebih besar dari jam mulai"})
 					return
 				}
-				// Auto-adjust durasi = end - start
 				req.DurationMinutes = diff
 			}
 
@@ -7845,17 +7842,43 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			// Cek access_code unik
-			var existingID string
-			err = database.DB.QueryRow(`
-				SELECT id FROM exam_schedules 
-				WHERE access_code = $1 AND deleted_at IS NULL
-			`, req.AccessCode).Scan(&existingID)
-			if err == nil && existingID != "" {
-				c.JSON(http.StatusConflict, gin.H{"error": "Kode akses sudah dipakai. Generate ulang."})
+			// ==========================================
+			// Normalize access code
+			// ==========================================
+			accessCode := strings.ToUpper(strings.TrimSpace(req.AccessCode))
+			if accessCode == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Kode akses wajib diisi"})
 				return
 			}
 
+			// ==========================================
+			// Cek duplikat access_code — HILANGKAN filter deleted_at
+			// dan hanya cek untuk (access_code, class_sub_group_id) yang akan dipakai.
+			// ==========================================
+			for _, subGroupID := range req.TargetSubGroupIDs {
+				var existingID string
+				err := database.DB.QueryRow(`
+					SELECT id FROM exam_schedules 
+					WHERE access_code = $1 
+					AND class_sub_group_id = $2
+					AND deleted_at IS NULL
+					LIMIT 1
+				`, accessCode, subGroupID).Scan(&existingID)
+
+				if err == nil && existingID != "" {
+					c.JSON(http.StatusConflict, gin.H{
+						"error": fmt.Sprintf(
+							"Kode akses '%s' sudah dipakai untuk sub kelas ini. Generate ulang atau pakai kode lain.",
+							accessCode,
+						),
+					})
+					return
+				}
+			}
+
+			// ==========================================
+			// Tx + Insert
+			// ==========================================
 			tx, err := database.DB.Begin()
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mulai transaksi"})
@@ -7884,6 +7907,14 @@ func SetupRoutes(r *gin.Engine) {
 					WHERE class_sub_group_id = $1 AND is_active = TRUE
 				`, subGroupID).Scan(&totalStudents)
 
+				// Lock check — SELECT FOR UPDATE biar anti race condition
+				var dummy string
+				_ = tx.QueryRow(`
+					SELECT id FROM exam_schedules
+					WHERE access_code = $1 AND class_sub_group_id = $2 AND deleted_at IS NULL
+					FOR UPDATE
+				`, accessCode, subGroupID).Scan(&dummy)
+
 				var scheduleID string
 				err = tx.QueryRow(`
 					INSERT INTO exam_schedules (
@@ -7906,10 +7937,21 @@ func SetupRoutes(r *gin.Engine) {
 					req.ScheduleDate, req.StartTime, req.EndTime, req.DurationMinutes,
 					durationMode,
 					req.Room, req.SupervisorName, req.SessionNotes,
-					req.AccessCode, req.RequireLogin,
+					accessCode, req.RequireLogin,
 					totalStudents, adminID).Scan(&scheduleID)
 
 				if err != nil {
+					// Deteksi unique violation
+					if strings.Contains(err.Error(), "23505") ||
+					strings.Contains(err.Error(), "duplicate key") {
+						c.JSON(http.StatusConflict, gin.H{
+							"error": fmt.Sprintf(
+								"Kode akses '%s' sudah dipakai untuk sub kelas ini. Generate ulang.",
+								accessCode,
+							),
+						})
+						return
+					}
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal menyimpan jadwal: " + err.Error()})
 					return
 				}
@@ -7924,7 +7966,7 @@ func SetupRoutes(r *gin.Engine) {
 			c.JSON(http.StatusCreated, gin.H{
 				"message":       fmt.Sprintf("%d jadwal berhasil dibuat", len(createdIDs)),
 				"schedule_ids":  createdIDs,
-				"access_code":   req.AccessCode,
+				"access_code":   accessCode,
 				"duration_mode": durationMode,
 			})
 		})
@@ -9379,6 +9421,36 @@ func SetupRoutes(r *gin.Engine) {
 				"student_id":   studentID,
 				"student_name": studentName,
 				"schedule_id":  scheduleID,
+			})
+		})
+
+		api.GET("/school-admin/exam-schedules/check-access-code", func(c *gin.Context) {
+			_, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			code := strings.ToUpper(strings.TrimSpace(c.Query("code")))
+			if code == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "code wajib diisi"})
+				return
+			}
+
+			var count int
+			err = database.DB.QueryRow(`
+				SELECT COUNT(*) FROM exam_schedules 
+				WHERE access_code = $1 AND deleted_at IS NULL
+			`, code).Scan(&count)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"access_code": code,
+				"available":   count == 0,
+				"used_count":  count,
 			})
 		})
 
