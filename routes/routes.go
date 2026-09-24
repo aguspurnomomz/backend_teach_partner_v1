@@ -19,6 +19,7 @@ import (
 	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/api/option"
+	"io"
 )
 
 // --- Struct untuk Superadmin ---
@@ -427,6 +428,18 @@ type CreateScheduleRequest struct {
     SessionNotes       string   `json:"session_notes"`
     AccessCode         string   `json:"access_code" binding:"required"`
     RequireLogin       bool     `json:"require_login"`
+}
+
+// ==========================================
+// EXAM REALTIME CONTROL STRUCTS
+// ==========================================
+
+type BlockStudentRequest struct {
+    Reason string `json:"reason" binding:"required,min=3"`
+}
+
+type WarnStudentRequest struct {
+    Message string `json:"message" binding:"required,min=3"`
 }
 
 func joinStrings(strs []string, sep string) string {
@@ -850,6 +863,60 @@ func generateSessionToken() string {
 		time.Sleep(1 * time.Nanosecond)
 	}
 	return "SES-" + string(b)
+}
+
+// sendExamControlBroadcast mengirim event realtime ke channel `exam-control-{scheduleID}`
+// lewat Supabase Realtime REST API.
+func sendExamControlBroadcast(scheduleID string, event map[string]any) error {
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	serviceRoleKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+	if supabaseURL == "" || serviceRoleKey == "" {
+		return fmt.Errorf("SUPABASE_URL atau SUPABASE_SERVICE_ROLE_KEY belum dikonfigurasi")
+	}
+
+	// Endpoint Broadcast HTTP di Supabase Realtime v2
+	url := fmt.Sprintf("%s/realtime/v1/api/broadcast", supabaseURL)
+
+	topic := fmt.Sprintf("exam-control-%s", scheduleID)
+
+	payload := map[string]any{
+		"messages": []map[string]any{
+			{
+				"topic":   topic,
+				"event":   "control",
+				"payload": event,
+			},
+		},
+	}
+
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("gagal marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return fmt.Errorf("gagal buat request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("apikey", serviceRoleKey)
+	req.Header.Set("Authorization", "Bearer "+serviceRoleKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("gagal kirim: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("broadcast gagal %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 func SetupRoutes(r *gin.Engine) {
@@ -7853,11 +7920,20 @@ func SetupRoutes(r *gin.Engine) {
 					sub.total_score, sub.percentage, sub.is_passed,
 					COALESCE(sub.is_flagged, false),
 					COALESCE(sub.tab_switch_count, 0),
-					sub.ip_address
+					sub.ip_address,
+					els.id AS session_id,
+					els.session_token,
+					COALESCE(els.is_blocked, false) AS is_blocked,
+					els.blocked_reason,
+					els.blocked_at
 				FROM students s
 				LEFT JOIN class_sub_groups csg ON s.class_sub_group_id = csg.id
 				LEFT JOIN exam_submissions sub 
 					ON sub.student_id = s.id AND sub.schedule_id = $1
+				LEFT JOIN exam_live_sessions els
+					ON els.student_id = s.id 
+					AND els.schedule_id = $1
+					AND els.submitted_at IS NULL
 				WHERE s.school_id = $2 
 				AND s.class_sub_group_id = (SELECT class_sub_group_id FROM exam_schedules WHERE id = $1)
 				AND s.is_active = TRUE
@@ -7887,10 +7963,17 @@ func SetupRoutes(r *gin.Engine) {
 				IsFlagged         bool       `json:"is_flagged"`
 				TabSwitchCount    int        `json:"tab_switch_count"`
 				IPAddress         *string    `json:"ip_address"`
+
+				// Realtime control
+				SessionID      *string    `json:"session_id"`
+				SessionToken   *string    `json:"session_token"`
+				IsBlocked      bool       `json:"is_blocked"`
+				BlockedReason  *string    `json:"blocked_reason"`
+				BlockedAt      *time.Time `json:"blocked_at"`
 			}
 
 			students := []StudentRow{}
-			var inProgress, submitted, graded, notStarted, flagged int
+			var inProgress, submitted, graded, notStarted, flagged, blocked int
 			var totalScoreSum float64
 			var scoreCount int
 
@@ -7904,6 +7987,13 @@ func SetupRoutes(r *gin.Engine) {
 				var isPassed sql.NullBool
 				var ipAddress sql.NullString
 
+				// New fields
+				var sessionID sql.NullString
+				var sessionToken sql.NullString
+				var isBlocked sql.NullBool
+				var blockedReason sql.NullString
+				var blockedAt sql.NullTime
+
 				err := rows.Scan(
 					&r.StudentID, &r.StudentName, &r.NISN, &r.StudentNumber,
 					&r.ClassSubGroupName,
@@ -7913,19 +8003,44 @@ func SetupRoutes(r *gin.Engine) {
 					&totalScore, &percentage, &isPassed,
 					&r.IsFlagged, &r.TabSwitchCount,
 					&ipAddress,
+					&sessionID,
+					&sessionToken,
+					&isBlocked,
+					&blockedReason,
+					&blockedAt,
 				)
 				if err != nil {
+					fmt.Printf("[MONITOR] Scan error: %v\n", err)  // ← tambah log
 					continue
 				}
 
+				// ==========================================
+				// ASSIGN SESSION FIELDS DULU
+				// ==========================================
+				if sessionID.Valid { r.SessionID = &sessionID.String }
+				if sessionToken.Valid { r.SessionToken = &sessionToken.String }
+				r.IsBlocked = isBlocked.Bool
+				if blockedReason.Valid { r.BlockedReason = &blockedReason.String }
+				if blockedAt.Valid { r.BlockedAt = &blockedAt.Time }
+
+				// ==========================================
+				// TENTUKAN STATUS (URUTAN PENTING!)
+				// ==========================================
 				if subID.Valid {
+					// Sudah submit → pakai status dari submission
 					r.SubmissionID = &subID.String
-				}
-				if status.Valid {
 					r.Status = status.String
+				} else if sessionID.Valid {
+					// Ada session aktif tapi belum submit → SEDANG MENGERJAKAN
+					r.Status = "in_progress"
 				} else {
+					// Tidak ada submission, tidak ada session → belum mulai
 					r.Status = "not_started"
 				}
+
+				// ==========================================
+				// ASSIGN FIELD LAINNYA
+				// ==========================================
 				if startedAt.Valid { r.StartedAt = &startedAt.Time }
 				if submittedAt.Valid { r.SubmittedAt = &submittedAt.Time }
 				if lastActivityAt.Valid { r.LastActivityAt = &lastActivityAt.Time }
@@ -7938,7 +8053,9 @@ func SetupRoutes(r *gin.Engine) {
 				if isPassed.Valid { r.IsPassed = &isPassed.Bool }
 				if ipAddress.Valid { r.IPAddress = &ipAddress.String }
 
-				// Aggregate stats
+				// ==========================================
+				// AGGREGATE STATS
+				// ==========================================
 				switch r.Status {
 				case "in_progress":
 					inProgress++
@@ -7951,6 +8068,9 @@ func SetupRoutes(r *gin.Engine) {
 				}
 				if r.IsFlagged {
 					flagged++
+				}
+				if r.IsBlocked {
+					blocked++
 				}
 				if r.Percentage != nil {
 					totalScoreSum += *r.Percentage
@@ -7995,6 +8115,7 @@ func SetupRoutes(r *gin.Engine) {
 					"graded":         graded,
 					"not_started":    notStarted,
 					"flagged":        flagged,
+					"blocked":        blocked,
 					"average_score":  avgScore,
 				},
 			})
@@ -8055,7 +8176,14 @@ func SetupRoutes(r *gin.Engine) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
-
+			// Auto-unblock semua siswa yang masih diblokir
+			_, _ = tx.Exec(`
+				UPDATE exam_live_sessions SET
+					is_blocked = false,
+					unblocked_at = NOW(),
+					updated_at = NOW()
+				WHERE schedule_id = $1 AND is_blocked = true
+			`, scheduleID)
 			if err := tx.Commit(); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal commit"})
 				return
@@ -8782,6 +8910,281 @@ func SetupRoutes(r *gin.Engine) {
 					"highest":      highest,
 					"lowest":       lowest,
 				},
+			})
+		})
+
+		// ==========================================
+		// BLOCK Student — admin sekolah blokir siswa dari ujian
+		// POST /api/school-admin/exam-live-sessions/:sessionId/block
+		// ==========================================
+		api.POST("/school-admin/exam-live-sessions/:sessionId/block", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			sessionID := c.Param("sessionId")
+
+			var req BlockStudentRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// 1. Ambil session info + validasi milik sekolah ini
+			var studentID, studentName, scheduleID, sessionToken string
+			var isBlocked bool
+			var submittedAt sql.NullTime
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					els.student_id, els.student_name_snapshot,
+					els.schedule_id, els.session_token,
+					els.is_blocked, els.submitted_at
+				FROM exam_live_sessions els
+				JOIN exam_schedules es ON es.id = els.schedule_id
+				WHERE els.id = $1 AND es.school_id = $2
+			`, sessionID, schoolID).Scan(
+				&studentID, &studentName, &scheduleID, &sessionToken,
+				&isBlocked, &submittedAt,
+			)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Sesi siswa tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			if submittedAt.Valid {
+				c.JSON(http.StatusConflict, gin.H{"error": "Siswa sudah selesai mengerjakan"})
+				return
+			}
+
+			if isBlocked {
+				c.JSON(http.StatusConflict, gin.H{"error": "Siswa sudah dalam status diblokir"})
+				return
+			}
+
+			// 2. Update DB
+			_, err = database.DB.Exec(`
+				UPDATE exam_live_sessions SET
+					is_blocked = true,
+					blocked_at = NOW(),
+					blocked_by = $1,
+					blocked_reason = $2,
+					unblocked_at = NULL,
+					unblocked_by = NULL,
+					last_activity_at = NOW()
+				WHERE id = $3
+			`, adminID, req.Reason, sessionID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal blokir: " + err.Error()})
+				return
+			}
+
+			// 3. Broadcast via Supabase Realtime (async — jangan block response)
+			go func() {
+				event := map[string]any{
+					"type":          "block",
+					"student_id":    studentID,
+					"session_token": sessionToken,
+					"reason":        req.Reason,
+					"blocked_by":    adminID,
+					"blocked_at":    time.Now().Format(time.RFC3339),
+				}
+				if bcErr := sendExamControlBroadcast(scheduleID, event); bcErr != nil {
+					fmt.Printf("[BLOCK] broadcast error: %v\n", bcErr)
+				}
+			}()
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":      fmt.Sprintf("Siswa %s berhasil diblokir", studentName),
+				"student_id":   studentID,
+				"student_name": studentName,
+				"schedule_id":  scheduleID,
+				"reason":       req.Reason,
+			})
+		})
+
+		// ==========================================
+		// UNBLOCK Student — cabut blokir
+		// POST /api/school-admin/exam-live-sessions/:sessionId/unblock
+		// ==========================================
+		api.POST("/school-admin/exam-live-sessions/:sessionId/unblock", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			sessionID := c.Param("sessionId")
+
+			// 1. Validasi
+			var studentID, studentName, scheduleID, sessionToken string
+			var isBlocked bool
+			var submittedAt sql.NullTime
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					els.student_id, els.student_name_snapshot,
+					els.schedule_id, els.session_token,
+					els.is_blocked, els.submitted_at
+				FROM exam_live_sessions els
+				JOIN exam_schedules es ON es.id = els.schedule_id
+				WHERE els.id = $1 AND es.school_id = $2
+			`, sessionID, schoolID).Scan(
+				&studentID, &studentName, &scheduleID, &sessionToken,
+				&isBlocked, &submittedAt,
+			)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Sesi siswa tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			if submittedAt.Valid {
+				c.JSON(http.StatusConflict, gin.H{"error": "Siswa sudah selesai mengerjakan"})
+				return
+			}
+
+			if !isBlocked {
+				c.JSON(http.StatusConflict, gin.H{"error": "Siswa tidak sedang diblokir"})
+				return
+			}
+
+			// 2. Update DB
+			_, err = database.DB.Exec(`
+				UPDATE exam_live_sessions SET
+					is_blocked = false,
+					unblocked_at = NOW(),
+					unblocked_by = $1,
+					last_activity_at = NOW()
+				WHERE id = $2
+			`, adminID, sessionID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal unblock: " + err.Error()})
+				return
+			}
+
+			// 3. Broadcast unblock
+			go func() {
+				event := map[string]any{
+					"type":          "unblock",
+					"student_id":    studentID,
+					"session_token": sessionToken,
+					"unblocked_by":  adminID,
+					"unblocked_at":  time.Now().Format(time.RFC3339),
+				}
+				if bcErr := sendExamControlBroadcast(scheduleID, event); bcErr != nil {
+					fmt.Printf("[UNBLOCK] broadcast error: %v\n", bcErr)
+				}
+			}()
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":      fmt.Sprintf("Blokir untuk %s berhasil dicabut", studentName),
+				"student_id":   studentID,
+				"student_name": studentName,
+				"schedule_id":  scheduleID,
+			})
+		})
+
+		// ==========================================
+		// WARN Student — kirim peringatan realtime
+		// POST /api/school-admin/exam-live-sessions/:sessionId/warn
+		// ==========================================
+		api.POST("/school-admin/exam-live-sessions/:sessionId/warn", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+			adminID, _ := getAdminIDFromUser(c)
+
+			sessionID := c.Param("sessionId")
+
+			var req WarnStudentRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// 1. Validasi
+			var studentID, studentName, scheduleID, sessionToken string
+			var isBlocked bool
+			var submittedAt sql.NullTime
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					els.student_id, els.student_name_snapshot,
+					els.schedule_id, els.session_token,
+					els.is_blocked, els.submitted_at
+				FROM exam_live_sessions els
+				JOIN exam_schedules es ON es.id = els.schedule_id
+				WHERE els.id = $1 AND es.school_id = $2
+			`, sessionID, schoolID).Scan(
+				&studentID, &studentName, &scheduleID, &sessionToken,
+				&isBlocked, &submittedAt,
+			)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Sesi siswa tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			if submittedAt.Valid {
+				c.JSON(http.StatusConflict, gin.H{"error": "Siswa sudah selesai mengerjakan"})
+				return
+			}
+
+			if isBlocked {
+				c.JSON(http.StatusConflict, gin.H{"error": "Siswa sedang diblokir, tidak bisa dikirim peringatan"})
+				return
+			}
+
+			// 2. Update DB — track last warning
+			_, err = database.DB.Exec(`
+				UPDATE exam_live_sessions SET
+					last_warning_at = NOW(),
+					last_warning_message = $1,
+					last_activity_at = NOW()
+				WHERE id = $2
+			`, req.Message, sessionID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal simpan peringatan: " + err.Error()})
+				return
+			}
+
+			// 3. Broadcast warning
+			go func() {
+				event := map[string]any{
+					"type":          "warning",
+					"student_id":    studentID,
+					"session_token": sessionToken,
+					"message":       req.Message,
+					"sent_by":       adminID,
+					"sent_at":       time.Now().Format(time.RFC3339),
+				}
+				if bcErr := sendExamControlBroadcast(scheduleID, event); bcErr != nil {
+					fmt.Printf("[WARN] broadcast error: %v\n", bcErr)
+				}
+			}()
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":      fmt.Sprintf("Peringatan terkirim ke %s", studentName),
+				"student_id":   studentID,
+				"student_name": studentName,
+				"schedule_id":  scheduleID,
 			})
 		})
 
