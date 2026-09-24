@@ -421,6 +421,7 @@ type CreateScheduleRequest struct {
     ScheduleDate       string   `json:"schedule_date" binding:"required"`
     StartTime          string   `json:"start_time" binding:"required"`
     EndTime            string   `json:"end_time" binding:"required"`
+    DurationMode       string   `json:"duration_mode"` 
     DurationMinutes    int      `json:"duration_minutes" binding:"required,min=1"`
     TargetSubGroupIDs  []string `json:"target_sub_group_ids" binding:"required,min=1"`
     Room               string   `json:"room"`
@@ -2139,6 +2140,7 @@ func SetupRoutes(r *gin.Engine) {
 			var examTitle, subject string
 			var passingScore float64
 			var durationMinutes int
+			var durationMode string
 
 			err := database.DB.QueryRow(`
 				SELECT 
@@ -2146,6 +2148,7 @@ func SetupRoutes(r *gin.Engine) {
 					es.schedule_date, es.start_time, es.end_time,
 					es.class_group_id, es.class_sub_group_id,
 					es.require_login, es.duration_minutes,
+					es.duration_mode, 
 					e.title, e.subject, COALESCE(e.passing_score, 0)
 				FROM exam_schedules es
 				JOIN school_exams e ON es.exam_id = e.id
@@ -2157,6 +2160,7 @@ func SetupRoutes(r *gin.Engine) {
 				&scheduleDate, &startTime, &endTime,
 				&classGroupID, &classSubGroupID,
 				&requireLogin, &durationMinutes,
+				&durationMode,
 				&examTitle, &subject, &passingScore,
 			)
 
@@ -2176,16 +2180,53 @@ func SetupRoutes(r *gin.Engine) {
 				endTime.Hour(), endTime.Minute(), 0, 0, now.Location(),
 			)
 
-			if now.Before(scheduleStart.Add(-10 * time.Minute)) {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"error": fmt.Sprintf("Ujian belum dimulai. Mulai pukul %s", startTime.Format("15:04")),
-				})
-				return
+			var expiresAt time.Time
+
+			if durationMode == "flexible" {
+				// ==========================================
+				// FLEXIBLE: window waktu buka
+				// ==========================================
+				if now.Before(scheduleStart) {
+					c.JSON(http.StatusBadRequest, gin.H{
+						"error": fmt.Sprintf("Ujian belum dibuka. Dibuka pukul %s", startTime.Format("15:04")),
+					})
+					return
+				}
+				if now.After(scheduleEnd) {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Window ujian sudah ditutup"})
+					return
+				}
+				
+
+				// expires = min(now + duration, scheduleEnd)
+				durationEnd := now.Add(time.Duration(durationMinutes) * time.Minute)
+				if durationEnd.Before(scheduleEnd) {
+					expiresAt = durationEnd
+				} else {
+					expiresAt = scheduleEnd
+				}
+
+			} else {
+				// ==========================================
+				// STRICT: seperti sebelumnya
+				// ==========================================
+				if now.Before(scheduleStart.Add(-10 * time.Minute)) {
+					c.JSON(http.StatusBadRequest, gin.H{
+						"error": fmt.Sprintf("Ujian belum dimulai. Mulai pukul %s", startTime.Format("15:04")),
+					})
+					return
+				}
+				if now.After(scheduleEnd) {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Waktu ujian sudah berakhir"})
+					return
+				}
+
+				// expires = end_time (durasi strict = sampai jam selesai)
+				expiresAt = scheduleEnd
 			}
-			if now.After(scheduleEnd) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Waktu ujian sudah berakhir"})
-				return
-			}
+
+			
+			
 
 			// 3. Cari student di class_sub_group ini pakai NISN + nama
 			var studentID, actualName, actualNISN string
@@ -2238,7 +2279,7 @@ func SetupRoutes(r *gin.Engine) {
 			`, scheduleID, studentID).Scan(&existingToken, &existingExpires)
 
 			var sessionToken string
-			var expiresAt time.Time
+			
 
 			if err == nil && existingToken != "" {
 				// Resume
@@ -7499,6 +7540,7 @@ func SetupRoutes(r *gin.Engine) {
 				SELECT 
 					es.id, es.exam_id,
 					e.title AS exam_title, e.subject, es.duration_minutes,
+					es.duration_mode,
 					es.schedule_date, es.start_time, es.end_time,
 					es.room, es.supervisor_name, es.access_code, es.status,
 					cg.name AS class_group_name,
@@ -7549,6 +7591,7 @@ func SetupRoutes(r *gin.Engine) {
 				ExamTitle          string          `json:"exam_title"`
 				Subject            string          `json:"subject"`
 				DurationMinutes    int             `json:"duration_minutes"`
+				DurationMode       string          `json:"duration_mode"`
 				ScheduleDate       string          `json:"schedule_date"`
 				StartTime          string          `json:"start_time"`
 				EndTime            string          `json:"end_time"`
@@ -7578,6 +7621,7 @@ func SetupRoutes(r *gin.Engine) {
 				err := rows.Scan(
 					&s.ID, &s.ExamID,
 					&s.ExamTitle, &s.Subject, &s.DurationMinutes,
+					&s.DurationMode,  
 					&scheduleDate, &startTime, &endTime,
 					&room, &supervisorName, &accessCode, &s.Status,
 					&classGroupName, &classSubGroupName,
@@ -7749,7 +7793,44 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
+			// ==========================================
+			// Validasi duration_mode
+			// ==========================================
+			durationMode := req.DurationMode
+			if durationMode == "" {
+				durationMode = "strict"
+			}
+			if durationMode != "strict" && durationMode != "flexible" {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "duration_mode harus 'strict' atau 'flexible'",
+				})
+				return
+			}
+
+			// Untuk strict: validasi & auto-adjust durasi
+			if durationMode == "strict" {
+				startT, err1 := parseTimeString(req.StartTime)
+				endT, err2 := parseTimeString(req.EndTime)
+				if err1 != nil || err2 != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Format jam tidak valid"})
+					return
+				}
+				diff := int(endT.Sub(startT).Minutes())
+				if diff <= 0 {
+					// Handle kalau lewat tengah malam (misal 23:00 → 01:00)
+					diff += 24 * 60
+				}
+				if diff <= 0 {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Jam selesai harus lebih besar dari jam mulai"})
+					return
+				}
+				// Auto-adjust durasi = end - start
+				req.DurationMinutes = diff
+			}
+
+			// ==========================================
 			// Validasi exam published & milik sekolah
+			// ==========================================
 			var examStatus string
 			err = database.DB.QueryRow(`
 				SELECT status FROM school_exams 
@@ -7784,7 +7865,6 @@ func SetupRoutes(r *gin.Engine) {
 
 			createdIDs := []string{}
 
-			// 1 jadwal per sub kelas — biar rapi di report
 			for _, subGroupID := range req.TargetSubGroupIDs {
 				// Validasi sub group milik sekolah
 				var validSchoolID string
@@ -7810,18 +7890,21 @@ func SetupRoutes(r *gin.Engine) {
 						school_id, exam_id,
 						class_group_id, class_sub_group_id,
 						schedule_date, start_time, end_time, duration_minutes,
+						duration_mode,
 						room, supervisor_name, session_notes,
 						access_code, require_login,
 						status, total_students,
 						created_by
 					) VALUES (
 						$1, $2, $3, $4, $5, $6, $7, $8,
-						NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''),
-						$12, $13, 'scheduled', $14, $15
+						$9,
+						NULLIF($10, ''), NULLIF($11, ''), NULLIF($12, ''),
+						$13, $14, 'scheduled', $15, $16
 					) RETURNING id
 				`, schoolID, req.ExamID,
 					classGroupID, subGroupID,
 					req.ScheduleDate, req.StartTime, req.EndTime, req.DurationMinutes,
+					durationMode,
 					req.Room, req.SupervisorName, req.SessionNotes,
 					req.AccessCode, req.RequireLogin,
 					totalStudents, adminID).Scan(&scheduleID)
@@ -7842,6 +7925,7 @@ func SetupRoutes(r *gin.Engine) {
 				"message":       fmt.Sprintf("%d jadwal berhasil dibuat", len(createdIDs)),
 				"schedule_ids":  createdIDs,
 				"access_code":   req.AccessCode,
+				"duration_mode": durationMode,
 			})
 		})
 
@@ -7861,6 +7945,7 @@ func SetupRoutes(r *gin.Engine) {
 				ExamTitle         string
 				Subject           string
 				DurationMinutes   int
+				DurationMode      string  
 				ScheduleDate      time.Time
 				StartTime         time.Time
 				EndTime           time.Time
@@ -7880,6 +7965,7 @@ func SetupRoutes(r *gin.Engine) {
 				SELECT 
 					es.id, es.exam_id,
 					e.title, e.subject, es.duration_minutes,
+					es.duration_mode,   
 					es.schedule_date, es.start_time, es.end_time,
 					es.room, es.supervisor_name, es.access_code, es.status,
 					cg.name, csg.name,
@@ -7893,6 +7979,7 @@ func SetupRoutes(r *gin.Engine) {
 			`, scheduleID, schoolID).Scan(
 				&s.ID, &s.ExamID,
 				&s.ExamTitle, &s.Subject, &s.DurationMinutes,
+				&s.DurationMode,      
 				&s.ScheduleDate, &s.StartTime, &s.EndTime,
 				&s.Room, &s.SupervisorName, &s.AccessCode, &s.Status,
 				&s.ClassGroupName, &s.ClassSubGroupName,
@@ -8093,6 +8180,7 @@ func SetupRoutes(r *gin.Engine) {
 					"exam_title":           s.ExamTitle,
 					"subject":              s.Subject,
 					"duration_minutes":     s.DurationMinutes,
+					"duration_mode":        s.DurationMode,  
 					"schedule_date":        s.ScheduleDate.Format("2006-01-02"),
 					"start_time":           s.StartTime.Format("15:04"),
 					"end_time":             s.EndTime.Format("15:04"),
@@ -8218,7 +8306,7 @@ func SetupRoutes(r *gin.Engine) {
 				TotalScore        float64
 				PassingScore      sql.NullFloat64
 				DurationMinutes   int
-
+				DurationMode 	  string
 				ScheduleDate      time.Time
 				StartTime         time.Time
 				EndTime           time.Time
@@ -8255,6 +8343,7 @@ func SetupRoutes(r *gin.Engine) {
 					e.grade_level, e.phase,
 					e.total_questions, e.total_score, e.passing_score,
 					es.duration_minutes,
+					es.duration_mode,      
 					es.schedule_date, es.start_time, es.end_time,
 					es.room, es.supervisor_name, es.session_notes,
 					es.access_code, es.require_login,
@@ -8275,6 +8364,7 @@ func SetupRoutes(r *gin.Engine) {
 				&s.GradeLevel, &s.Phase,
 				&s.TotalQuestions, &s.TotalScore, &s.PassingScore,
 				&s.DurationMinutes,
+				&s.DurationMode,  
 				&s.ScheduleDate, &s.StartTime, &s.EndTime,
 				&s.Room, &s.SupervisorName, &s.SessionNotes,
 				&s.AccessCode, &s.RequireLogin,
@@ -8411,26 +8501,130 @@ func SetupRoutes(r *gin.Engine) {
 
 			scheduleID := c.Param("id")
 
-			result, err := database.DB.Exec(`
+			// Ambil body opsional: { reason }
+			var req struct {
+				Reason string `json:"reason"`
+			}
+			_ = c.ShouldBindJSON(&req)
+
+			// 1. Ambil status & info jadwal
+			var currentStatus string
+			var examTitle, classSubGroupName string
+			err = database.DB.QueryRow(`
+				SELECT 
+					es.status,
+					e.title,
+					COALESCE(csg.name, '')
+				FROM exam_schedules es
+				JOIN school_exams e ON es.exam_id = e.id
+				LEFT JOIN class_sub_groups csg ON es.class_sub_group_id = csg.id
+				WHERE es.id = $1 AND es.school_id = $2 AND es.deleted_at IS NULL
+			`, scheduleID, schoolID).Scan(&currentStatus, &examTitle, &classSubGroupName)
+
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Jadwal tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			// 2. Cek status dasar
+			if currentStatus == "cancelled" {
+				c.JSON(http.StatusConflict, gin.H{"error": "Jadwal sudah dibatalkan sebelumnya"})
+				return
+			}
+			if currentStatus == "completed" {
+				c.JSON(http.StatusConflict, gin.H{"error": "Jadwal sudah selesai, tidak bisa dibatalkan"})
+				return
+			}
+
+			// 3. Cek apakah ada siswa yang sudah mulai mengerjakan
+			//    (session aktif tanpa submitted_at, ATAU sudah ada submission)
+			var activeSessions int
+			var totalSubmissions int
+
+			_ = database.DB.QueryRow(`
+				SELECT COUNT(*) 
+				FROM exam_live_sessions
+				WHERE schedule_id = $1 AND submitted_at IS NULL
+			`, scheduleID).Scan(&activeSessions)
+
+			_ = database.DB.QueryRow(`
+				SELECT COUNT(*) 
+				FROM exam_submissions
+				WHERE schedule_id = $1
+			`, scheduleID).Scan(&totalSubmissions)
+
+			// 4. Validasi: tidak bisa dibatalkan kalau sudah ada aktivitas siswa
+			if activeSessions > 0 || totalSubmissions > 0 {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": fmt.Sprintf(
+						"Tidak bisa dibatalkan. Sudah ada %d siswa yang memulai dan %d siswa yang submit. Gunakan 'Tutup Sesi' di halaman Monitor untuk menghentikan.",
+						activeSessions, totalSubmissions,
+					),
+					"active_sessions":   activeSessions,
+					"total_submissions": totalSubmissions,
+				})
+				return
+			}
+
+			// 5. Cek status jadwal
+			if currentStatus == "ongoing" {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": "Jadwal sudah berlangsung. Gunakan 'Tutup Sesi' di halaman Monitor untuk menghentikan.",
+				})
+				return
+			}
+
+			// 6. Aman dibatalkan → lakukan update
+			tx, err := database.DB.Begin()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mulai transaksi"})
+				return
+			}
+			defer tx.Rollback()
+
+			// Update status jadwal
+			result, err := tx.Exec(`
 				UPDATE exam_schedules 
 				SET status = 'cancelled', updated_at = NOW()
-				WHERE id = $1 AND school_id = $2 
-				AND status IN ('scheduled', 'ongoing')
+				WHERE id = $1 AND school_id = $2
 			`, scheduleID, schoolID)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal membatalkan jadwal: " + err.Error()})
 				return
 			}
 
 			affected, _ := result.RowsAffected()
 			if affected == 0 {
-				c.JSON(http.StatusNotFound, gin.H{
-					"error": "Jadwal tidak ditemukan atau sudah selesai/dibatalkan",
-				})
+				c.JSON(http.StatusNotFound, gin.H{"error": "Jadwal tidak ditemukan"})
 				return
 			}
 
-			c.JSON(http.StatusOK, gin.H{"message": "Jadwal berhasil dibatalkan"})
+			// Hapus semua live session yang belum submit (kalau ada sisa)
+			// — seharusnya kosong, tapi ini safety net
+			_, _ = tx.Exec(`
+				DELETE FROM exam_live_sessions
+				WHERE schedule_id = $1 AND submitted_at IS NULL
+			`, scheduleID)
+
+			if err := tx.Commit(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal commit"})
+				return
+			}
+
+			// 7. Log aktivitas (opsional)
+			adminID, _ := getAdminIDFromUser(c)
+			fmt.Printf("[CANCEL SCHEDULE] Admin %s membatalkan jadwal %s (%s) — %s\n",
+				adminID, scheduleID, examTitle, classSubGroupName)
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":     "Jadwal berhasil dibatalkan",
+				"schedule_id": scheduleID,
+				"reason":      req.Reason,
+			})
 		})
 
 		api.DELETE("/school-admin/exam-schedules/:id", func(c *gin.Context) {
