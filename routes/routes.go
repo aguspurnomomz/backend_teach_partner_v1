@@ -158,6 +158,12 @@ type CreateSchoolExamRequest struct {
 	Targets         []ExamTargetInput   `json:"targets"` // WAJIB diisi minimal 1
 }
 
+type GradeEssayRequest struct {
+    QuestionID string  `json:"question_id" binding:"required"`
+    Score      float64 `json:"score" binding:"min=0"`
+    Feedback   string  `json:"feedback"`
+}
+
 // Members Struct
 // ==========================================
 // TEACHER MEMBERSHIP STRUCTS
@@ -8325,6 +8331,458 @@ func SetupRoutes(r *gin.Engine) {
 			}
 
 			c.JSON(http.StatusOK, gin.H{"message": "Jadwal berhasil dihapus"})
+		})
+
+		api.GET("/school-admin/exam-submissions/:id", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			submissionID := c.Param("id")
+
+			var s struct {
+				ID                string
+				ScheduleID        string
+				ExamID            string
+				ExamTitle         string
+				Subject           string
+				StudentID         string
+				StudentName       string
+				StudentNISN       sql.NullString
+				StudentNumber     sql.NullString
+				ClassSubGroupName sql.NullString
+				Status            string
+				StartedAt         sql.NullTime
+				SubmittedAt       sql.NullTime
+				LastActivityAt    sql.NullTime
+				TimeSpentSeconds  sql.NullInt64
+				TotalScore        sql.NullFloat64
+				MaxScore          sql.NullFloat64
+				Percentage        sql.NullFloat64
+				IsPassed          sql.NullBool
+				TabSwitchCount    int
+				IsFlagged         bool
+				IPAddress         sql.NullString
+				UserAgent         sql.NullString
+				Answers           []byte
+				PassingScore      sql.NullFloat64
+			}
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					sub.id, sub.schedule_id, sub.exam_id,
+					e.title, e.subject,
+					sub.student_id, sub.student_name,
+					sub.student_nisn, sub.student_number,
+					csg.name,
+					sub.status,
+					sub.started_at, sub.submitted_at, sub.last_activity_at,
+					sub.time_spent_seconds,
+					sub.total_score, sub.max_score, sub.percentage, sub.is_passed,
+					sub.tab_switch_count, sub.is_flagged,
+					sub.ip_address, sub.user_agent,
+					sub.answers,
+					COALESCE(e.passing_score, 70)
+				FROM exam_submissions sub
+				JOIN school_exams e ON sub.exam_id = e.id
+				LEFT JOIN students stu ON stu.id = sub.student_id
+				LEFT JOIN class_sub_groups csg ON stu.class_sub_group_id = csg.id
+				WHERE sub.id = $1 AND sub.school_id = $2
+			`, submissionID, schoolID).Scan(
+				&s.ID, &s.ScheduleID, &s.ExamID,
+				&s.ExamTitle, &s.Subject,
+				&s.StudentID, &s.StudentName,
+				&s.StudentNISN, &s.StudentNumber,
+				&s.ClassSubGroupName,
+				&s.Status,
+				&s.StartedAt, &s.SubmittedAt, &s.LastActivityAt,
+				&s.TimeSpentSeconds,
+				&s.TotalScore, &s.MaxScore, &s.Percentage, &s.IsPassed,
+				&s.TabSwitchCount, &s.IsFlagged,
+				&s.IPAddress, &s.UserAgent,
+				&s.Answers,
+				&s.PassingScore,
+			)
+
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Submission tidak ditemukan"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			var answers []any
+			_ = json.Unmarshal(s.Answers, &answers)
+
+			c.JSON(http.StatusOK, gin.H{
+				"submission": gin.H{
+					"id":                   s.ID,
+					"schedule_id":          s.ScheduleID,
+					"exam_id":              s.ExamID,
+					"exam_title":           s.ExamTitle,
+					"subject":              s.Subject,
+					"student_id":           s.StudentID,
+					"student_name":         s.StudentName,
+					"student_nisn":         s.StudentNISN.String,
+					"student_number":       s.StudentNumber.String,
+					"class_sub_group_name": s.ClassSubGroupName.String,
+					"status":               s.Status,
+					"started_at":           s.StartedAt.Time,
+					"submitted_at":         s.SubmittedAt.Time,
+					"last_activity_at":     s.LastActivityAt.Time,
+					"time_spent_seconds":   s.TimeSpentSeconds.Int64,
+					"total_score":          s.TotalScore.Float64,
+					"max_score":            s.MaxScore.Float64,
+					"percentage":           s.Percentage.Float64,
+					"is_passed":            s.IsPassed.Bool,
+					"passing_score":        s.PassingScore.Float64,
+					"tab_switch_count":     s.TabSwitchCount,
+					"is_flagged":           s.IsFlagged,
+					"ip_address":           s.IPAddress.String,
+					"user_agent":           s.UserAgent.String,
+					"answers":              answers,
+					"questions":            []any{}, // optional: include question snapshots
+				},
+			})
+		})
+
+		api.PATCH("/school-admin/exam-submissions/:id/grade-essay", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			submissionID := c.Param("id")
+
+			var req GradeEssayRequest
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Format tidak valid: " + err.Error()})
+				return
+			}
+
+			// 1. Ambil submission
+			var scheduleID, examID, studentID string
+			var answersJSON []byte
+			var passingScore float64
+
+			err = database.DB.QueryRow(`
+				SELECT sub.schedule_id, sub.exam_id, sub.student_id, sub.answers,
+					COALESCE(e.passing_score, 70)
+				FROM exam_submissions sub
+				JOIN school_exams e ON sub.exam_id = e.id
+				WHERE sub.id = $1 AND sub.school_id = $2
+			`, submissionID, schoolID).Scan(
+				&scheduleID, &examID, &studentID, &answersJSON, &passingScore,
+			)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Submission tidak ditemukan"})
+				return
+			}
+
+			// 2. Parse answers, update skor essay
+			var answers []map[string]any
+			if err := json.Unmarshal(answersJSON, &answers); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Format answers error"})
+				return
+			}
+
+			found := false
+			var newTotalScore, newMaxScore float64
+
+			for i, a := range answers {
+				qID, _ := a["question_id"].(string)
+				maxScore, _ := a["max_score"].(float64)
+				newMaxScore += maxScore
+
+				if qID == req.QuestionID {
+					answers[i]["score"] = req.Score
+					answers[i]["feedback"] = req.Feedback
+					answers[i]["graded_at"] = time.Now().Format(time.RFC3339)
+					found = true
+					newTotalScore += req.Score
+				} else {
+					if sc, ok := a["score"].(float64); ok {
+						newTotalScore += sc
+					}
+				}
+			}
+
+			if !found {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Soal tidak ditemukan di submission"})
+				return
+			}
+
+			// 3. Cek apakah semua essay sudah dinilai
+			hasPending := false
+			for _, a := range answers {
+				if a["type"] == "essay" {
+					if _, ok := a["score"]; !ok || a["score"] == nil {
+						hasPending = true
+						break
+					}
+				}
+			}
+
+			// 4. Hitung ulang persentase
+			percentage := 0.0
+			if newMaxScore > 0 {
+				percentage = (newTotalScore / newMaxScore) * 100
+			}
+
+			newStatus := "graded"
+			if hasPending {
+				newStatus = "graded_with_pending"
+			}
+
+			// 5. Update submission
+			newAnswersJSON, _ := json.Marshal(answers)
+			_, err = database.DB.Exec(`
+				UPDATE exam_submissions SET
+					answers = $1::jsonb,
+					total_score = $2,
+					percentage = $3,
+					is_passed = $4,
+					status = $5,
+					updated_at = NOW(),
+					fully_graded_at = CASE WHEN $6 = 'graded' THEN NOW() ELSE fully_graded_at END
+				WHERE id = $7
+			`, newAnswersJSON, newTotalScore, percentage, percentage >= passingScore,
+				newStatus, newStatus, submissionID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			// 6. Update schedule stats
+			_, _ = database.DB.Exec(`
+				UPDATE exam_schedules SET
+					total_graded = (SELECT COUNT(*) FROM exam_submissions WHERE schedule_id = $1 AND status = 'graded'),
+					average_score = (SELECT AVG(percentage) FROM exam_submissions WHERE schedule_id = $1),
+					updated_at = NOW()
+				WHERE id = $1
+			`, scheduleID)
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":       "Penilaian berhasil disimpan",
+				"total_score":   newTotalScore,
+				"percentage":    percentage,
+				"is_passed":     percentage >= passingScore,
+				"status":        newStatus,
+				"has_pending":   hasPending,
+			})
+		})
+
+		api.GET("/school-admin/exam-schedules/:id/grades", func(c *gin.Context) {
+			schoolID, err := getSchoolIDFromUser(c)
+			if err != nil {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
+
+			scheduleID := c.Param("id")
+
+			// 1. Ambil schedule info
+			var s struct {
+				ID              string
+				ExamID          string
+				ExamTitle       string
+				Subject         string
+				ScheduleDate    time.Time
+				StartTime       time.Time
+				EndTime         time.Time
+				Room            sql.NullString
+				SupervisorName  sql.NullString
+				PassingScore    sql.NullFloat64
+				ClassSubGroupID sql.NullString
+				TotalStudents   int
+			}
+
+			err = database.DB.QueryRow(`
+				SELECT 
+					es.id, es.exam_id, e.title, e.subject,
+					es.schedule_date, es.start_time, es.end_time,
+					es.room, es.supervisor_name,
+					COALESCE(e.passing_score, 70),
+					es.class_sub_group_id,
+					es.total_students
+				FROM exam_schedules es
+				JOIN school_exams e ON es.exam_id = e.id
+				WHERE es.id = $1 AND es.school_id = $2 AND es.deleted_at IS NULL
+			`, scheduleID, schoolID).Scan(
+				&s.ID, &s.ExamID, &s.ExamTitle, &s.Subject,
+				&s.ScheduleDate, &s.StartTime, &s.EndTime,
+				&s.Room, &s.SupervisorName,
+				&s.PassingScore,
+				&s.ClassSubGroupID,
+				&s.TotalStudents,
+			)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Jadwal tidak ditemukan"})
+				return
+			}
+
+			// 2. Query semua siswa target + LEFT JOIN submissions
+			rows, err := database.DB.Query(`
+				SELECT 
+					s.id, s.full_name, COALESCE(s.nisn, ''), COALESCE(s.student_number, ''),
+					COALESCE(csg.name, ''),
+					sub.id, sub.status,
+					sub.total_score, sub.max_score, sub.percentage, sub.is_passed,
+					sub.submitted_at, sub.time_spent_seconds,
+					COALESCE(sub.tab_switch_count, 0),
+					COALESCE(sub.is_flagged, false),
+					sub.answers
+				FROM students s
+				LEFT JOIN class_sub_groups csg ON s.class_sub_group_id = csg.id
+				LEFT JOIN exam_submissions sub 
+					ON sub.student_id = s.id AND sub.schedule_id = $1
+				WHERE s.school_id = $2 
+				AND s.class_sub_group_id = (SELECT class_sub_group_id FROM exam_schedules WHERE id = $1)
+				AND s.is_active = TRUE
+				ORDER BY s.full_name ASC
+			`, scheduleID, schoolID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			type StudentRow struct {
+				StudentID         string   `json:"student_id"`
+				StudentName       string   `json:"student_name"`
+				StudentNISN       string   `json:"student_nisn"`
+				StudentNumber     string   `json:"student_number"`
+				ClassSubGroupName string   `json:"class_sub_group_name"`
+				SubmissionID      *string  `json:"submission_id"`
+				Status            string   `json:"status"`
+				TotalScore        *float64 `json:"total_score"`
+				MaxScore          *float64 `json:"max_score"`
+				Percentage        *float64 `json:"percentage"`
+				IsPassed          *bool    `json:"is_passed"`
+				SubmittedAt       *time.Time `json:"submitted_at"`
+				TimeSpentSeconds  *int     `json:"time_spent_seconds"`
+				TabSwitchCount    int      `json:"tab_switch_count"`
+				IsFlagged         bool     `json:"is_flagged"`
+				PendingEssayCount int      `json:"pending_essay_count"`
+			}
+
+			students := []StudentRow{}
+			var submitted, graded, pending, notStarted, passed, failed, flagged int
+			var totalPct float64
+			var pctCount int
+			var highest, lowest *float64
+
+			for rows.Next() {
+				var r StudentRow
+				var subID sql.NullString
+				var status sql.NullString
+				var totalScore, maxScore, percentage sql.NullFloat64
+				var isPassed sql.NullBool
+				var submittedAt sql.NullTime
+				var timeSpent sql.NullInt64
+				var answersJSON []byte
+
+				err := rows.Scan(
+					&r.StudentID, &r.StudentName, &r.StudentNISN, &r.StudentNumber,
+					&r.ClassSubGroupName,
+					&subID, &status,
+					&totalScore, &maxScore, &percentage, &isPassed,
+					&submittedAt, &timeSpent,
+					&r.TabSwitchCount, &r.IsFlagged,
+					&answersJSON,
+				)
+				if err != nil {
+					continue
+				}
+
+				if subID.Valid { r.SubmissionID = &subID.String }
+				if status.Valid { r.Status = status.String } else { r.Status = "not_started" }
+				if totalScore.Valid { r.TotalScore = &totalScore.Float64 }
+				if maxScore.Valid { r.MaxScore = &maxScore.Float64 }
+				if percentage.Valid {
+					r.Percentage = &percentage.Float64
+					totalPct += percentage.Float64
+					pctCount++
+					if highest == nil || percentage.Float64 > *highest { v := percentage.Float64; highest = &v }
+					if lowest == nil || percentage.Float64 < *lowest { v := percentage.Float64; lowest = &v }
+				}
+				if isPassed.Valid { r.IsPassed = &isPassed.Bool }
+				if submittedAt.Valid { r.SubmittedAt = &submittedAt.Time }
+				if timeSpent.Valid { t := int(timeSpent.Int64); r.TimeSpentSeconds = &t }
+
+				// Count pending essays
+				if len(answersJSON) > 0 {
+					var answers []map[string]any
+					if json.Unmarshal(answersJSON, &answers) == nil {
+						for _, a := range answers {
+							if a["type"] == "essay" {
+								if _, ok := a["score"]; !ok || a["score"] == nil {
+									r.PendingEssayCount++
+								}
+							}
+						}
+					}
+				}
+
+				// Aggregate
+				switch r.Status {
+				case "in_progress": notStarted++ // in_progress tidak masuk "submitted"
+				case "submitted":
+					submitted++
+				case "graded", "graded_with_pending":
+					submitted++
+					graded++
+					if r.Status == "graded_with_pending" { pending++ }
+				case "not_started":
+					notStarted++
+				}
+				if r.IsPassed != nil && *r.IsPassed { passed++ }
+				if r.IsPassed != nil && !*r.IsPassed { failed++ }
+				if r.IsFlagged { flagged++ }
+
+				students = append(students, r)
+			}
+
+			var avg *float64
+			if pctCount > 0 {
+				a := totalPct / float64(pctCount)
+				avg = &a
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"schedule": gin.H{
+					"id":               s.ID,
+					"exam_id":          s.ExamID,
+					"exam_title":       s.ExamTitle,
+					"subject":          s.Subject,
+					"schedule_date":    s.ScheduleDate.Format("2006-01-02"),
+					"start_time":       s.StartTime.Format("15:04"),
+					"end_time":         s.EndTime.Format("15:04"),
+					"room":             s.Room.String,
+					"supervisor_name":  s.SupervisorName.String,
+					"passing_score":    s.PassingScore.Float64,
+					"total_students":   s.TotalStudents,
+				},
+				"students": students,
+				"stats": gin.H{
+					"total":        len(students),
+					"submitted":    submitted,
+					"graded":       graded,
+					"pending":      pending,
+					"not_started":  notStarted,
+					"passed":       passed,
+					"failed":       failed,
+					"flagged":      flagged,
+					"average":      avg,
+					"highest":      highest,
+					"lowest":       lowest,
+				},
+			})
 		})
 
 	}
