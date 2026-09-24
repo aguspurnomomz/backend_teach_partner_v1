@@ -2296,25 +2296,38 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			// 1. Ambil session
+			// ==========================================
+			// 1. Ambil session + exam_id + started_at
+			// ==========================================
 			var sessionID, scheduleID, examID, schoolID, studentID string
 			var studentName, studentNISN string
 			var questionsSnapshot []byte
+			var startedAt time.Time
 			var submittedAt sql.NullTime
 
 			err := database.DB.QueryRow(`
 				SELECT 
-					id, schedule_id, school_id, student_id,
-					student_name_snapshot, student_nisn_snapshot,
-					questions_snapshot, submitted_at
-				FROM exam_live_sessions
-				WHERE session_token = $1
+					els.id, els.schedule_id,
+					es.exam_id,
+					els.school_id, els.student_id,
+					els.student_name_snapshot, els.student_nisn_snapshot,
+					els.questions_snapshot,
+					els.started_at,
+					els.submitted_at
+				FROM exam_live_sessions els
+				JOIN exam_schedules es ON es.id = els.schedule_id
+				WHERE els.session_token = $1
 			`, sessionToken).Scan(
-				&sessionID, &scheduleID, &schoolID, &studentID,
+				&sessionID, &scheduleID,
+				&examID,
+				&schoolID, &studentID,
 				&studentName, &studentNISN,
-				&questionsSnapshot, &submittedAt,
+				&questionsSnapshot,
+				&startedAt,
+				&submittedAt,
 			)
 			if err != nil {
+				fmt.Printf("[SUBMIT] Gagal ambil session: %v\n", err)
 				c.JSON(http.StatusNotFound, gin.H{"error": "Sesi ujian tidak valid"})
 				return
 			}
@@ -2324,20 +2337,25 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
+			// ==========================================
 			// 2. Ambil exam info (KKM, total score)
+			// ==========================================
 			var passingScore float64
 			var examQuestionsJSON []byte
 			err = database.DB.QueryRow(`
 				SELECT COALESCE(passing_score, 0), questions 
 				FROM school_exams 
-				WHERE id = (SELECT exam_id FROM exam_schedules WHERE id = $1)
-			`, scheduleID).Scan(&passingScore, &examQuestionsJSON)
+				WHERE id = $1
+			`, examID).Scan(&passingScore, &examQuestionsJSON)
 			if err != nil {
+				fmt.Printf("[SUBMIT] Gagal ambil exam info: %v\n", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal ambil data ujian"})
 				return
 			}
 
+			// ==========================================
 			// 3. Auto-grade PG
+			// ==========================================
 			var examQuestions []struct {
 				ID            string  `json:"id"`
 				Type          string  `json:"type"`
@@ -2345,11 +2363,13 @@ func SetupRoutes(r *gin.Engine) {
 				AnswerKey     string  `json:"answer_key"`
 				Score         float64 `json:"score"`
 			}
-			_ = json.Unmarshal(examQuestionsJSON, &examQuestions)
+			if err := json.Unmarshal(examQuestionsJSON, &examQuestions); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Format soal error"})
+				return
+			}
 
 			var totalScore float64
 			var maxScore float64
-			var pgScore float64
 			var hasEssay bool
 
 			answersDetail := []map[string]any{}
@@ -2371,12 +2391,10 @@ func SetupRoutes(r *gin.Engine) {
 					if isCorrect {
 						detail["score"] = q.Score
 						totalScore += q.Score
-						pgScore += q.Score
 					} else {
 						detail["score"] = 0.0
 					}
 				} else {
-					// Essay — pending manual grading
 					detail["score"] = nil
 					detail["is_correct"] = nil
 					hasEssay = true
@@ -2395,7 +2413,9 @@ func SetupRoutes(r *gin.Engine) {
 				status = "graded_with_pending"
 			}
 
+			// ==========================================
 			// 4. Insert submission
+			// ==========================================
 			answersJSON, _ := json.Marshal(answersDetail)
 
 			var submissionID string
@@ -2409,31 +2429,35 @@ func SetupRoutes(r *gin.Engine) {
 					ip_address, user_agent
 				) VALUES (
 					$1, $2, $3, $4, $5, $6,
-					(SELECT started_at FROM exam_live_sessions WHERE id = $7),
-					NOW(),
+					$7, NOW(),
 					$8::jsonb, $9, $10, $11, $12,
 					$13, $14, $15, $16, $17
 				) RETURNING id
 			`, scheduleID, examID, schoolID, studentID,
 				studentName, studentNISN,
-				sessionID,
+				startedAt,   // ← pakai variabel, bukan subquery
 				answersJSON, totalScore, maxScore, percentage, percentage >= passingScore,
 				status, req.TabSwitchCount, req.TimeSpentSeconds,
 				c.ClientIP(), c.Request.UserAgent(),
 			).Scan(&submissionID)
 			if err != nil {
+				fmt.Printf("[SUBMIT] Gagal insert submission: %v\n", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal simpan jawaban: " + err.Error()})
 				return
 			}
 
+			// ==========================================
 			// 5. Mark session submitted
+			// ==========================================
 			_, _ = database.DB.Exec(`
 				UPDATE exam_live_sessions 
 				SET submitted_at = NOW() 
 				WHERE id = $1
 			`, sessionID)
 
+			// ==========================================
 			// 6. Update schedule stats
+			// ==========================================
 			_, _ = database.DB.Exec(`
 				UPDATE exam_schedules SET
 					total_submitted = (SELECT COUNT(*) FROM exam_submissions WHERE schedule_id = $1),
@@ -4543,10 +4567,6 @@ func SetupRoutes(r *gin.Engine) {
 			c.JSON(http.StatusOK, gin.H{"message": "Event berhasil dihapus"})
 		})
 
-		// ==========================================
-		// Shift Absensi
-		// ==========================================
-
 		// List shifts
 		api.GET("/school-admin/attendance/shifts", func(c *gin.Context) {
 			fmt.Println("════════════════════════════════════════")
@@ -4888,10 +4908,6 @@ func SetupRoutes(r *gin.Engine) {
 			c.JSON(http.StatusOK, gin.H{"message": "Shift berhasil dihapus"})
 		})
 
-		// ==========================================
-		// shift class assignment
-		// ==========================================
-
 		// List assignments
 		api.GET("/school-admin/attendance/assignments", func(c *gin.Context) {
 			schoolID, err := getSchoolIDFromUser(c)
@@ -5080,10 +5096,6 @@ func SetupRoutes(r *gin.Engine) {
 
 			c.JSON(http.StatusOK, gin.H{"message": "Assignment berhasil dihapus"})
 		})
-
-		// ==========================================
-		// Kode QR Siswa
-		// ==========================================
 
 		// List QR codes siswa
 		api.GET("/school-admin/students/qr-list", func(c *gin.Context) {
@@ -5300,10 +5312,6 @@ func SetupRoutes(r *gin.Engine) {
 				"qr_token": newToken,
 			})
 		})
-
-		// ==========================================
-		// Sessions Attendance
-		// ==========================================
 
 		// List semua sessions
 		api.GET("/school-admin/attendance/sessions", func(c *gin.Context) {
@@ -5884,10 +5892,6 @@ func SetupRoutes(r *gin.Engine) {
 			c.JSON(http.StatusOK, gin.H{"records": records, "total": len(records)})
 		})
 
-		// ==========================================
-		// SCAN HANDLER (CORE)
-		// ==========================================
-
 		api.POST("/school-admin/attendance/scan", func(c *gin.Context) {
 			schoolID, err := getSchoolIDFromUser(c)
 			if err != nil {
@@ -6123,7 +6127,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
-				// ==========================================
+		// ==========================================
 		// TEACHER: Join School (Self-service)
 		// B2C teacher bisa klaim dirinya sebagai guru di sekolah tertentu
 		// ==========================================
@@ -6475,9 +6479,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
-		// ==========================================
 		// SCHOOL ADMIN: Invite teacher via email
-		// ==========================================
 		api.POST("/school-admin/teachers/invite", func(c *gin.Context) {
 			schoolID, err := getSchoolIDFromUser(c)
 			if err != nil {
@@ -6604,9 +6606,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
-		// ==========================================
 		// SCHOOL ADMIN: Assign guru existing (dari user_id)
-		// ==========================================
 		api.POST("/school-admin/teachers/assign", func(c *gin.Context) {
 			schoolID, err := getSchoolIDFromUser(c)
 			if err != nil {
@@ -6669,9 +6669,7 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 
-		// ==========================================
 		// SCHOOL ADMIN: Remove teacher (soft leave)
-		// ==========================================
 		api.DELETE("/school-admin/teachers/:id", func(c *gin.Context) {
 			schoolID, err := getSchoolIDFromUser(c)
 			if err != nil {
@@ -6707,10 +6705,8 @@ func SetupRoutes(r *gin.Engine) {
 			c.JSON(http.StatusOK, gin.H{"message": "Guru berhasil di-remove dari sekolah"})
 		})
 
-		// ==========================================
-		// SCHOOL ADMIN: SCHOOL EXAMS (CRUD)
-		// ==========================================
 
+		// SCHOOL ADMIN: SCHOOL EXAMS (CRUD)
 		// -------------------- LIST --------------------
 		// GET /api/school-admin/exams?status=draft&subject=Matematika&search=uts
 		api.GET("/school-admin/exams", func(c *gin.Context) {
